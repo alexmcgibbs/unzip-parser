@@ -1,0 +1,2 @@
+ALTER TABLE accounts
+ADD COLUMN IF NOT EXISTS holdings JSONB NOT NULL DEFAULT '[]'::jsonb;

@@ -1,0 +1,72 @@
+{
+  "client_id": "CLT-29481",
+  "first_name": "Jane",
+  "last_name": "Smith",
+  "email": "jane.smith@example.com",
+  "accounts": [
+    {
+      "account_id": "ACC-10042",
+      "account_type": "INDIVIDUAL",
+      "custodian": "Apex Clearing",
+      "opened_date": "2023-03-15",
+      "status": "ACTIVE",
+      "holdings": [
+        {
+          "ticker": "VTI",
+          "cusip": "922908769",
+          "description": "Vanguard Total Stock Market ETF",
+          "quantity": 150.0,
+          "market_value": 38250.00,
+          "cost_basis": 33750.00,
+          "price": 255.00,
+          "asset_class": "US_EQUITY"
+        },
+        {
+          "ticker": "BND",
+          "cusip": "921937835",
+          "description": "Vanguard Total Bond Market ETF",
+          "quantity": 200.0,
+          "market_value": 14800.00,
+          "cost_basis": 15200.00,
+          "price": 74.00,
+          "asset_class": "FIXED_INCOME"
+        },
+        {
+          "ticker": "VXUS",
+          "cusip": "922042775",
+          "description": "Vanguard Total International Stock ETF",
+          "quantity": 100.0,
+          "market_value": 5600.00,
+          "cost_basis": 5100.00,
+          "price": 56.00,
+          "asset_class": "INTL_EQUITY"
+        }
+      ],
+      "cash_balance": 2450.75,
+      "total_value": 61100.75
+    },
+    {
+      "account_id": "ACC-10043",
+      "account_type": "ROTH_IRA",
+      "custodian": "Apex Clearing",
+      "opened_date": "2023-06-01",
+      "status": "ACTIVE",
+      "holdings": [
+        {
+          "ticker": "VOO",
+          "cusip": "922908363",
+          "description": "Vanguard S&P 500 ETF",
+          "quantity": 45.0,
+          "market_value": 22275.00,
+          "cost_basis": 19800.00,
+          "price": 495.00,
+          "asset_class": "US_EQUITY"
+        }
+      ],
+      "cash_balance": 1200.00,
+      "total_value": 23475.00
+    }
+  ],
+  "advisor_id": "ADV-0052",
+  "last_updated": "2025-03-02T14:30:00Z"
+}

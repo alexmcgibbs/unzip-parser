@@ -1,0 +1,35 @@
+{
+  "name": "webhook-zip-worker",
+  "version": "1.0.0",
+  "description": "Express TypeScript webhook service that unzips uploaded archives in a worker thread",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "npm run build && npm run start",
+    "test": "npm run build && node --test tests"
+  },
+  "dependencies": {
+    "adm-zip": "^0.5.16",
+    "busboy": "^1.6.0",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "multer": "^1.4.5-lts.2",
+    "pg": "^8.13.3",
+    "pg-copy-streams": "^7.0.0",
+    "stream-json": "^2.1.0",
+    "unzipper": "^0.12.3"
+  },
+  "devDependencies": {
+    "@types/adm-zip": "^0.5.8",
+    "@types/busboy": "^1.5.4",
+    "@types/express": "^4.17.21",
+    "@types/multer": "^1.4.12",
+    "@types/node": "^22.13.10",
+    "@types/pg": "^8.11.10",
+    "@types/pg-copy-streams": "^1.2.5",
+    "@types/unzipper": "^0.10.11",
+    "supertest": "^7.1.1",
+    "typescript": "^5.8.2"
+  }
+}
