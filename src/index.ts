@@ -2,7 +2,7 @@ import express, { Request, Response } from "express";
 import path from "node:path";
 import { Worker } from "node:worker_threads";
 import { hasDatabaseConfig, testDatabaseConnection } from "./db";
-import { createQueuedJob, updateJobStatus } from "./models/jobs";
+import { createQueuedJob, getJobDetails, getJobRetries, updateJobRetry, updateJobStatus, updateJobPgbossId } from "./models/jobs";
 import { enqueueJob, registerWorker, stopBoss } from "./pgBoss";
 import { WorkerError } from "./types";
 
@@ -46,6 +46,46 @@ function runWorker(workerFileName: string, data: unknown): Promise<void> {
   });
 }
 
+function isRetryableError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  const message = error.message.toLowerCase();
+  const code = (error as NodeJS.ErrnoException).code;
+
+  // Network-related errors
+  const networkErrors = [
+    "ECONNREFUSED",
+    "ECONNRESET",
+    "ENOTFOUND",
+    "ETIMEDOUT",
+    "EHOSTUNREACH",
+    "ENETUNREACH",
+    "EPIPE"
+  ];
+  if (networkErrors.includes(code ?? "")) {
+    return true;
+  }
+
+  // Message-based detection for connection/timeout issues
+  const retryablePatterns = [
+    "connection",
+    "timeout",
+    "temporarily unavailable",
+    "too many connections",
+    "database connection",
+    "unable to reach",
+    "network",
+    "socket"
+  ];
+  if (retryablePatterns.some((pattern) => message.includes(pattern))) {
+    return true;
+  }
+
+  return false;
+}
+
 function unzipInUrlWorker(fileUrl: string, jobId: string): Promise<void> {
   return runWorker("unzipperWorker.js", { fileUrl, jobId });
 }
@@ -58,8 +98,22 @@ async function processWebhookJob(data: WebhookJobData): Promise<void> {
     await updateJobStatus(data.jobId, "complete", null);
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : "Unknown worker error";
-    await updateJobStatus(data.jobId, "error", errorMessage);
-    throw error;
+
+    if (isRetryableError(error)) {
+      // For retryable errors, increment retry count and reset status to queued
+      // pg-boss will automatically retry this job
+      const currentRetries = await getJobRetries(data.jobId);
+      await updateJobRetry(data.jobId, currentRetries + 1);
+      console.log(
+        `Retryable error on job ${data.jobId} (retries: ${currentRetries + 1}/3): ${errorMessage}`
+      );
+      // Re-throw so pg-boss handles the retry
+      throw error;
+    } else {
+      // Fatal error; mark as failed and do not retry
+      await updateJobStatus(data.jobId, "error", errorMessage);
+      console.log(`Fatal error on job ${data.jobId}: ${errorMessage}`);
+    }
   }
 }
 
@@ -84,8 +138,42 @@ async function stopWebhookQueueWorker(): Promise<void> {
 app.get("/", (_req: Request, res: Response) => {
   res.json({
     message: "Webhook ZIP service is running.",
-    uploadEndpoint: "POST /webhook (application/json: { fileUrl })"
+    uploadEndpoint: "POST /webhook (application/json: { fileUrl })",
+    jobEndpoint: "GET /job/:id"
   });
+});
+
+app.get("/job/:id", async (req: Request, res: Response) => {
+  try {
+    const jobId = req.params.id;
+
+    if (!jobId) {
+      res.status(400).json({ error: "job id is required." });
+      return;
+    }
+
+    if (!hasDatabaseConfig()) {
+      res.status(503).json({
+        error: "Job lookup is unavailable.",
+        details: "Postgres connection is not configured."
+      });
+      return;
+    }
+
+    const result = await getJobDetails(jobId);
+    if (!result) {
+      res.status(404).json({ error: "Job not found." });
+      return;
+    }
+
+    res.status(200).json(result);
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : "Unknown error";
+    res.status(500).json({
+      error: "Failed to fetch job.",
+      details: errorMessage
+    });
+  }
 });
 
 app.post("/webhook", async (req: Request, res: Response) => {
@@ -128,7 +216,8 @@ app.post("/webhook", async (req: Request, res: Response) => {
     const jobId = await createQueuedJob(fileUrl);
 
     try {
-      await enqueueJob<WebhookJobData>(WEBHOOK_QUEUE_NAME, { fileUrl, jobId });
+      const pgbossJobId = await enqueueJob<WebhookJobData>(WEBHOOK_QUEUE_NAME, { fileUrl, jobId });
+      await updateJobPgbossId(jobId, pgbossJobId);
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : "Unknown error";
       await updateJobStatus(jobId, "error", errorMessage);

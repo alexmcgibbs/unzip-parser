@@ -40,6 +40,18 @@ function createZipSourceStream(fileUrl: string): NodeJS.ReadableStream {
   throw new Error(`Unsupported file URL protocol: ${url.protocol}`);
 }
 
+const MAX_UNZIPPED_DEFAULT_BYTES = 100 * 1024 * 1024; // 100 MB
+
+function parseMaxUnzippedBytes(): number {
+  const raw = process.env.MAX_UNZIPPED;
+  if (!raw) return MAX_UNZIPPED_DEFAULT_BYTES;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(`MAX_UNZIPPED env var is invalid: "${raw}". Must be a positive number of bytes.`);
+  }
+  return parsed;
+}
+
 (async function run() {
   try {
     const { fileUrl, jobId } = workerData as WorkerPayload;
@@ -52,11 +64,12 @@ function createZipSourceStream(fileUrl: string): NodeJS.ReadableStream {
       throw new Error("jobId is required.");
     }
 
+    const maxUnzippedBytes = parseMaxUnzippedBytes();
+
     const zipStream = createZipSourceStream(fileUrl).pipe(unzipper.Parse({ forceStream: true }));
     const entries: ZipEntryResult[] = [];
     const extractedFiles: string[] = [];
     const jsonFilePaths: string[] = [];
-    const persistPromises: Promise<unknown>[] = [];
 
     for await (const entry of zipStream) {
       const zipEntry: ZipEntryResult = {
@@ -73,12 +86,19 @@ function createZipSourceStream(fileUrl: string): NodeJS.ReadableStream {
       }
 
       if (!zipEntry.isDirectory && zipEntry.name.toLowerCase().endsWith(".json")) {
+        const uncompressedSize = Number(entry.vars.uncompressedSize ?? 0);
+        if (uncompressedSize > maxUnzippedBytes) {
+          throw new Error(
+            `Entry "${zipEntry.name}" uncompressed size ${uncompressedSize} bytes exceeds MAX_UNZIPPED limit of ${maxUnzippedBytes} bytes.`
+          );
+        }
+
         const jsonBuffer = await readEntryToBuffer(entry);
         const jsonContents = JSON.parse(jsonBuffer.toString("utf8"));
         jsonFilePaths.push(zipEntry.name);
 
         if (hasDatabaseConfig()) {
-          persistPromises.push(persistWebhookPayload(zipEntry.name, jsonContents, jobId));
+          await persistWebhookPayload(zipEntry.name, jsonContents, jobId);
         }
 
         continue;
@@ -105,9 +125,7 @@ function createZipSourceStream(fileUrl: string): NodeJS.ReadableStream {
       )
     );
 
-    if (persistPromises.length > 0) {
-      await Promise.all(persistPromises);
-    } else if (!hasDatabaseConfig()) {
+    if (!hasDatabaseConfig()) {
       console.log("Postgres connection not configured. Skipping database write.");
     }
 

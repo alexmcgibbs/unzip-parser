@@ -35,13 +35,14 @@ async function canConnectToDb() {
 async function hasRequiredTables() {
   const result = await pool.query(
     `SELECT
+       to_regclass('public.jobs') AS jobs_table,
        to_regclass('public.files') AS files_table,
        to_regclass('public.accounts') AS accounts_table,
        to_regclass('public.holdings') AS holdings_table`
   );
 
   const row = result.rows[0];
-  return Boolean(row.files_table && row.accounts_table && row.holdings_table);
+  return Boolean(row.jobs_table && row.files_table && row.accounts_table && row.holdings_table);
 }
 
 async function waitForCondition(check, timeoutMs = 45000, intervalMs = 500) {
@@ -110,6 +111,21 @@ test("persists files, accounts, and holdings rows after webhook upload", async (
   assert.equal(response.body.message, "ZIP received and queued for processing.");
   assert.equal(typeof response.body.jobId, "string");
   assert.ok(response.body.jobId.length > 0);
+
+  await waitForCondition(async () => {
+    const jobResult = await pool.query(
+      `SELECT status
+       FROM jobs
+       WHERE job_id = $1`,
+      [response.body.jobId]
+    );
+
+    if (jobResult.rows.length === 0) {
+      return false;
+    }
+
+    return jobResult.rows[0].status === "complete";
+  });
 
   await waitForCondition(async () => {
     const countResult = await pool.query(
@@ -183,6 +199,26 @@ test("persists files, accounts, and holdings rows after webhook upload", async (
 
   assert.equal(holdingsCountResult.rows[0].total, expectedHoldingsCount);
 
+  const jobLookupResponse = await request(app).get(`/job/${response.body.jobId}`).expect(200);
+  assert.equal(jobLookupResponse.body.job.job_id, response.body.jobId);
+  assert.equal(jobLookupResponse.body.job.status, "complete");
+  assert.ok(Array.isArray(jobLookupResponse.body.files));
+  assert.equal(jobLookupResponse.body.files.length, 1);
+
+  const lookedUpFile = jobLookupResponse.body.files[0];
+  assert.equal(lookedUpFile.file_name, "sample.json");
+  assert.equal(lookedUpFile.job_id, response.body.jobId);
+  assert.equal(lookedUpFile.client_id, expectedPayload.client_id);
+  assert.ok(Array.isArray(lookedUpFile.accounts));
+  assert.equal(lookedUpFile.accounts.length, expectedPayload.accounts.length);
+
+  const lookedUpHoldingsCount = lookedUpFile.accounts.reduce(
+    (sum, account) => sum + account.holdings.length,
+    0
+  );
+  assert.equal(lookedUpHoldingsCount, expectedHoldingsCount);
+
+  await pool.query("DELETE FROM jobs WHERE job_id = $1", [response.body.jobId]);
   await pool.query("DELETE FROM files WHERE client_id = $1", [expectedPayload.client_id]);
 });
 

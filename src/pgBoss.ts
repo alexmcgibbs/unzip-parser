@@ -40,7 +40,7 @@ async function getBoss(): Promise<PgBoss> {
 export async function enqueueJob<T extends object>(queueName: string, data: T): Promise<string> {
   const instance = await getBoss();
   await instance.createQueue(queueName);
-  const id = await instance.send(queueName, data);
+  const id = await instance.send(queueName, data, { retryLimit: 3 });
 
   if (!id) {
     throw new Error(`Failed to enqueue job for queue ${queueName}.`);
