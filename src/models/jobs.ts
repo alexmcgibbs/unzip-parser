@@ -75,8 +75,8 @@ export async function createQueuedJob(fileUrl: string): Promise<string> {
   const jobId = randomUUID();
 
   await pool.query(
-    `INSERT INTO jobs (job_id, url, status, retries, error, pgboss_job_id)
-     VALUES ($1, $2, 'queued', 0, NULL, NULL)`,
+    `INSERT INTO jobs (job_id, url, status, retries, error)
+     VALUES ($1, $2, 'queued', 0, NULL)`,
     [jobId, fileUrl]
   );
 

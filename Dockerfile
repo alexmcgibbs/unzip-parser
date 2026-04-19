@@ -23,7 +23,6 @@ RUN npm ci --omit=dev
 COPY --from=builder /app/dist ./dist
 COPY sample.json ./sample.json
 COPY sample.zip ./sample.zip
-COPY uploads/.gitkeep ./uploads/.gitkeep
 
 EXPOSE 3000
 

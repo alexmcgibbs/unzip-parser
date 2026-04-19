@@ -3,7 +3,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const http = require("node:http");
-const { Worker } = require("node:worker_threads");
+const { FixedThreadPool } = require("poolifier");
 
 function startZipServer(zipPath) {
   return new Promise((resolve, reject) => {
@@ -35,29 +35,15 @@ function startZipServer(zipPath) {
   });
 }
 
-function runUnzipperWorker(fileUrl) {
-  return new Promise((resolve, reject) => {
-    const workerPath = path.resolve(__dirname, "../dist/workers/unzipperWorker.js");
-    const worker = new Worker(workerPath, {
-      workerData: { fileUrl, jobId: "test-job-id" }
-    });
+async function runUnzipperPoolWorker(fileUrl) {
+  const workerPath = path.resolve(__dirname, "../dist/workers/unzipperPoolWorker.js");
+  const pool = new FixedThreadPool(1, workerPath);
 
-    worker.once("message", (data) => {
-      if (data && data.error) {
-        reject(new Error(data.error));
-        return;
-      }
-
-      resolve(data);
-    });
-
-    worker.once("error", reject);
-    worker.once("exit", (code) => {
-      if (code !== 0) {
-        reject(new Error(`Worker exited with code ${code}`));
-      }
-    });
-  });
+  try {
+    return await pool.execute({ fileUrl, jobId: "test-job-id" });
+  } finally {
+    await pool.destroy();
+  }
 }
 
 async function withZipServer(fn) {
@@ -73,19 +59,19 @@ async function withZipServer(fn) {
   }
 }
 
-test("unzipperWorker streams ZIP from http URL", async () => {
+test("unzipperPoolWorker streams ZIP from http URL", async () => {
   await withZipServer(async (fileUrl) => {
-    const result = await runUnzipperWorker(fileUrl);
+    const result = await runUnzipperPoolWorker(fileUrl);
 
     assert.equal(result.ok, true);
     assert.equal(result.resolvedName, "sample.json");
   });
 });
 
-test("unzipperWorker resolves name from ZIP entries when filename is omitted", async () => {
+test("unzipperPoolWorker resolves name from ZIP entries when filename is omitted", async () => {
   await withZipServer(async (fileUrl) => {
     // Worker derives name from extracted ZIP entry path
-    const result = await runUnzipperWorker(fileUrl);
+    const result = await runUnzipperPoolWorker(fileUrl);
 
     assert.equal(result.ok, true);
 

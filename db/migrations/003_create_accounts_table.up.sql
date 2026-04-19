@@ -5,7 +5,6 @@ CREATE TABLE IF NOT EXISTS accounts (
   custodian TEXT NOT NULL,
   opened_date DATE NOT NULL,
   status TEXT NOT NULL,
-  holdings JSONB NOT NULL DEFAULT '[]'::jsonb,
   cash_balance NUMERIC(18, 2) NOT NULL,
   total_value NUMERIC(18, 2) NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),

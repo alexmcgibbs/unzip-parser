@@ -1,10 +1,11 @@
 import express, { Request, Response } from "express";
 import path from "node:path";
-import { Worker } from "node:worker_threads";
+import { availableParallelism } from "node:os";
+import { FixedThreadPool } from "poolifier";
 import { hasDatabaseConfig, testDatabaseConnection } from "./db";
 import { createQueuedJob, getJobDetails, getJobRetries, updateJobRetry, updateJobStatus, updateJobPgbossId } from "./models/jobs";
 import { enqueueJob, registerWorker, stopBoss } from "./pgBoss";
-import { WorkerError } from "./types";
+import { ZipWorkerPayload, ZipWorkerResult } from "./workers/processZipJob";
 
 const app = express();
 app.use(express.json());
@@ -18,32 +19,18 @@ type WebhookJobData = {
 };
 
 let queueWorkerStarted = false;
+let unzipWorkerPool: FixedThreadPool<ZipWorkerPayload, ZipWorkerResult> | null = null;
 
-function runWorker(workerFileName: string, data: unknown): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const workerPath = path.resolve(__dirname, "workers", workerFileName);
-    const worker = new Worker(workerPath, {
-      workerData: data
-    });
+function getUnzipWorkerPool(): FixedThreadPool<ZipWorkerPayload, ZipWorkerResult> {
+  if (unzipWorkerPool) {
+    return unzipWorkerPool;
+  }
 
-    worker.once("message", (data: { ok: true } | WorkerError) => {
-      if ("error" in data) {
-        reject(new Error(data.error));
-        return;
-      }
-      resolve();
-    });
-
-    worker.once("error", (err) => {
-      reject(err);
-    });
-
-    worker.once("exit", (code) => {
-      if (code !== 0) {
-        reject(new Error(`Worker exited with code ${code}`));
-      }
-    });
-  });
+  const poolSize = Math.max(1, availableParallelism());
+  const workerPath = path.resolve(__dirname, "workers", "unzipperPoolWorker.js");
+  unzipWorkerPool = new FixedThreadPool<ZipWorkerPayload, ZipWorkerResult>(poolSize, workerPath);
+  console.log(`Initialized unzip worker pool with ${poolSize} threads.`);
+  return unzipWorkerPool;
 }
 
 function isRetryableError(error: unknown): boolean {
@@ -87,7 +74,8 @@ function isRetryableError(error: unknown): boolean {
 }
 
 function unzipInUrlWorker(fileUrl: string, jobId: string): Promise<void> {
-  return runWorker("unzipperWorker.js", { fileUrl, jobId });
+  const pool = getUnzipWorkerPool();
+  return pool.execute({ fileUrl, jobId }).then(() => undefined);
 }
 
 async function processWebhookJob(data: WebhookJobData): Promise<void> {
@@ -122,6 +110,8 @@ async function startWebhookQueueWorker(): Promise<void> {
     return;
   }
 
+  getUnzipWorkerPool();
+
   await registerWorker<WebhookJobData>(WEBHOOK_QUEUE_NAME, async (jobData) => {
     await processWebhookJob(jobData);
   });
@@ -131,6 +121,11 @@ async function startWebhookQueueWorker(): Promise<void> {
 }
 
 async function stopWebhookQueueWorker(): Promise<void> {
+  if (unzipWorkerPool) {
+    await unzipWorkerPool.destroy();
+    unzipWorkerPool = null;
+  }
+
   await stopBoss();
   queueWorkerStarted = false;
 }
