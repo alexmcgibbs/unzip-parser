@@ -1,86 +1,27 @@
 import express, { Request, Response } from "express";
-import multer from "multer";
 import path from "node:path";
-import fs from "node:fs";
-import { pathToFileURL, fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 import { hasDatabaseConfig, testDatabaseConnection } from "./db";
 import { enqueueJob, registerWorker, stopBoss } from "./pgBoss";
 import { WorkerError } from "./types";
 
 const app = express();
+app.use(express.json());
+
 const port = Number(process.env.PORT) || 3000;
 const WEBHOOK_QUEUE_NAME = "webhook-zip-process";
-const DEFAULT_FILE_LIMIT = 2 * 1024 * 1024 * 1024;
-const DEFAULT_LARGE_FILE_LIMIT = 50 * 1024 * 1024;
 
 type WebhookJobData = {
   fileUrl: string;
-  originalFileName: string;
 };
 
 let queueWorkerStarted = false;
 
-const uploadsDir = path.resolve(process.cwd(), "uploads");
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
-}
-
-const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, uploadsDir),
-  filename: (_req, file, cb) => {
-    const timestamp = Date.now();
-    const safeName = file.originalname.replace(/[^a-zA-Z0-9._-]/g, "_");
-    cb(null, `${timestamp}_${safeName}`);
-  }
-});
-
-function parseSizeLimit(
-  value: string | undefined,
-  fallback: number,
-  variableName: string,
-  defaultDisplayValue: string
-): number {
-  if (!value) {
-    return fallback;
-  }
-
-  const normalized = value.trim().toLowerCase();
-  const match = normalized.match(/^(\d+(?:\.\d+)?)\s*(b|kb|mb|gb)?$/);
-
-  if (!match) {
-    console.warn(
-      `Invalid ${variableName} value \"${value}\". Falling back to ${defaultDisplayValue}.`
-    );
-    return fallback;
-  }
-
-  const amount = Number(match[1]);
-  const unit = match[2] ?? "b";
-  const multipliers: Record<string, number> = {
-    b: 1,
-    kb: 1024,
-    mb: 1024 * 1024,
-    gb: 1024 * 1024 * 1024
-  };
-
-  return Math.floor(amount * multipliers[unit]);
-}
-
-const fileLimit = parseSizeLimit(process.env.FILE_LIMIT, DEFAULT_FILE_LIMIT, "FILE_LIMIT", "2gb");
-const largeFileLimit = parseSizeLimit(
-  process.env.LARGE_FILE_LIMIT,
-  DEFAULT_LARGE_FILE_LIMIT,
-  "LARGE_FILE_LIMIT",
-  "50mb"
-);
-const upload = multer({ storage, limits: { fileSize: fileLimit } });
-
-function runWorker(workerFileName: string, zipPath: string, originalFileName: string): Promise<void> {
+function runWorker(workerFileName: string, data: unknown): Promise<void> {
   return new Promise((resolve, reject) => {
     const workerPath = path.resolve(__dirname, "workers", workerFileName);
     const worker = new Worker(workerPath, {
-      workerData: { zipPath, originalFileName }
+      workerData: data
     });
 
     worker.once("message", (data: { ok: true } | WorkerError) => {
@@ -103,76 +44,12 @@ function runWorker(workerFileName: string, zipPath: string, originalFileName: st
   });
 }
 
-function unzipInWorker(zipPath: string, originalFileName: string): Promise<void> {
-  return runWorker("unzipWorker.js", zipPath, originalFileName);
-}
-
-function unzipInLargeWorker(zipPath: string, originalFileName: string): Promise<void> {
-  return runWorker("largeUnzipWorker.js", zipPath, originalFileName);
-}
-
-function isUnzipUnavailableError(error: unknown): boolean {
-  if (!(error instanceof Error)) {
-    return false;
-  }
-
-  return error.message.includes("spawn unzip ENOENT");
-}
-
-async function processZipFile(
-  zipPath: string,
-  uploadedFileSize: number,
-  originalFileName: string
-): Promise<void> {
-  if (uploadedFileSize <= largeFileLimit) {
-    console.log(
-      `Selected worker: unzipWorker (file size: ${uploadedFileSize} bytes, threshold: ${largeFileLimit} bytes)`
-    );
-    return unzipInWorker(zipPath, originalFileName);
-  }
-
-  try {
-    console.log(
-      `Selected worker: largeUnzipWorker (file size: ${uploadedFileSize} bytes, threshold: ${largeFileLimit} bytes)`
-    );
-    return await unzipInLargeWorker(zipPath, originalFileName);
-  } catch (error) {
-    if (!isUnzipUnavailableError(error)) {
-      throw error;
-    }
-
-    console.warn("unzip binary is unavailable. Falling back to unzipWorker.");
-    return unzipInWorker(zipPath, originalFileName);
-  }
-}
-
-function resolveZipPath(fileUrl: string): string {
-  try {
-    const url = new URL(fileUrl);
-    if (url.protocol !== "file:") {
-      throw new Error(`Unsupported URL protocol: ${url.protocol}`);
-    }
-    return fileURLToPath(url);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "Invalid file URL.";
-    throw new Error(`Invalid job file URL: ${message}`);
-  }
+function unzipInUrlWorker(fileUrl: string): Promise<void> {
+  return runWorker("unzipperWorker.js", { fileUrl });
 }
 
 async function processWebhookJob(data: WebhookJobData): Promise<void> {
-  const zipPath = resolveZipPath(data.fileUrl);
-
-  if (!fs.existsSync(zipPath)) {
-    throw new Error("Job archive file not found.");
-  }
-
-  const uploadedFileSize = fs.statSync(zipPath).size;
-
-  try {
-    await processZipFile(zipPath, uploadedFileSize, data.originalFileName);
-  } finally {
-    await cleanupArtifacts(zipPath);
-  }
+  await unzipInUrlWorker(data.fileUrl);
 }
 
 async function startWebhookQueueWorker(): Promise<void> {
@@ -193,51 +70,39 @@ async function stopWebhookQueueWorker(): Promise<void> {
   queueWorkerStarted = false;
 }
 
-async function cleanupArtifacts(archivePath?: string, extractedTo?: string): Promise<void> {
-  const cleanupTasks: Promise<void>[] = [];
-
-  if (archivePath) {
-    cleanupTasks.push(
-      fs.promises.rm(archivePath, { force: true }).catch((error: unknown) => {
-        const message = error instanceof Error ? error.message : "Unknown cleanup error";
-        console.warn(`Failed to remove uploaded archive ${archivePath}: ${message}`);
-      })
-    );
-  }
-
-  if (extractedTo) {
-    cleanupTasks.push(
-      fs.promises.rm(extractedTo, { recursive: true, force: true }).catch((error: unknown) => {
-        const message = error instanceof Error ? error.message : "Unknown cleanup error";
-        console.warn(`Failed to remove extracted directory ${extractedTo}: ${message}`);
-      })
-    );
-  }
-
-  await Promise.all(cleanupTasks);
-}
-
 app.get("/", (_req: Request, res: Response) => {
   res.json({
     message: "Webhook ZIP service is running.",
-    uploadEndpoint: "POST /webhook (multipart/form-data, file field name: file)"
+    uploadEndpoint: "POST /webhook (application/json: { fileUrl })"
   });
 });
 
-app.post("/webhook", upload.single("file"), async (req: Request, res: Response) => {
-  let uploadedPath: string | undefined;
-
+app.post("/webhook", async (req: Request, res: Response) => {
   try {
-    if (!req.file) {
-      res.status(400).json({ error: "No file uploaded. Use form-data with field name 'file'." });
+    const { fileUrl } = (req.body ?? {}) as Partial<WebhookJobData>;
+
+    if (!fileUrl || typeof fileUrl !== "string") {
+      res.status(400).json({ error: "fileUrl is required in JSON body." });
       return;
     }
 
-    uploadedPath = req.file.path;
+    let parsedUrl: URL;
+    try {
+      parsedUrl = new URL(fileUrl);
+      if (!["http:", "https:", "file:"].includes(parsedUrl.protocol)) {
+        res.status(400).json({ error: "fileUrl must use http, https, or file protocol." });
+        return;
+      }
+    } catch {
+      res.status(400).json({ error: "fileUrl must be a valid absolute URL." });
+      return;
+    }
 
-    if (!req.file.originalname.toLowerCase().endsWith(".zip")) {
-      res.status(400).json({ error: "Uploaded file must be a .zip archive." });
-      await cleanupArtifacts(uploadedPath);
+    // Enforce .zip only when URL path clearly exposes a filename (has an extension).
+    const exposedName = path.posix.basename(parsedUrl.pathname || "");
+    const hasExposedExtension = exposedName.includes(".");
+    if (hasExposedExtension && !exposedName.toLowerCase().endsWith(".zip")) {
+      res.status(400).json({ error: "fileUrl path filename must end with .zip when provided." });
       return;
     }
 
@@ -246,15 +111,10 @@ app.post("/webhook", upload.single("file"), async (req: Request, res: Response) 
         error: "Queue processing is unavailable.",
         details: "Postgres connection is not configured for pg-boss."
       });
-      await cleanupArtifacts(uploadedPath);
       return;
     }
 
-    const fileUrl = pathToFileURL(req.file.path).toString();
-    await enqueueJob<WebhookJobData>(WEBHOOK_QUEUE_NAME, {
-      fileUrl,
-      originalFileName: req.file.originalname
-    });
+    await enqueueJob<WebhookJobData>(WEBHOOK_QUEUE_NAME, { fileUrl });
 
     res.status(202).json({
       message: "ZIP received and queued for processing."
@@ -274,8 +134,6 @@ app.post("/webhook", upload.single("file"), async (req: Request, res: Response) 
         details: errorMessage
       });
     }
-
-    await cleanupArtifacts(uploadedPath);
   }
 });
 

@@ -2,6 +2,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
+const { pathToFileURL } = require("node:url");
 const request = require("supertest");
 const { Pool } = require("pg");
 
@@ -89,6 +90,7 @@ test("persists files, accounts, and holdings rows after webhook upload", async (
 
   const projectRoot = path.resolve(__dirname, "..");
   const sampleZipPath = path.join(projectRoot, "sample.zip");
+  const sampleZipUrl = pathToFileURL(sampleZipPath).toString();
   const sampleJsonPath = path.join(projectRoot, "sample.json");
   const expectedPayload = JSON.parse(fs.readFileSync(sampleJsonPath, "utf8"));
   const expectedHoldingsCount = expectedPayload.accounts.reduce(
@@ -102,7 +104,7 @@ test("persists files, accounts, and holdings rows after webhook upload", async (
 
   const response = await request(app)
     .post("/webhook")
-    .attach("file", sampleZipPath)
+    .send({ fileUrl: sampleZipUrl })
     .expect(202);
 
   assert.equal(response.body.message, "ZIP received and queued for processing.");
@@ -136,7 +138,7 @@ test("persists files, accounts, and holdings rows after webhook upload", async (
 
   assert.equal(filesResult.rows.length, 1, "Expected one files row for the client_id");
   const fileRow = filesResult.rows[0];
-  assert.equal(fileRow.file_name, "sample.zip");
+  assert.equal(fileRow.file_name, "sample.json");
   assert.equal(fileRow.client_id, expectedPayload.client_id);
   assert.equal(fileRow.first_name, expectedPayload.first_name);
   assert.equal(fileRow.last_name, expectedPayload.last_name);

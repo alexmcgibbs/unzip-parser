@@ -1,6 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const path = require("node:path");
+const { pathToFileURL } = require("node:url");
 const request = require("supertest");
 
 process.env.DB_HOST ||= "localhost";
@@ -11,13 +12,14 @@ process.env.DB_PASSWORD ||= "webhook_password";
 
 const { app, stopWebhookQueueWorker } = require("../dist/index.js");
 
-test("uploads sample.zip and returns success message", async () => {
+test("queues sample.zip URL and returns success message", async () => {
   const projectRoot = path.resolve(__dirname, "..");
   const sampleZipPath = path.join(projectRoot, "sample.zip");
+  const sampleZipUrl = pathToFileURL(sampleZipPath).toString();
 
   const response = await request(app)
     .post("/webhook")
-    .attach("file", sampleZipPath)
+    .send({ fileUrl: sampleZipUrl })
     .expect(202);
 
   assert.equal(response.body.message, "ZIP received and queued for processing.");
