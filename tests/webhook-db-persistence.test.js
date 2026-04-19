@@ -11,8 +11,10 @@ process.env.DB_PORT ||= "5432";
 process.env.DB_NAME ||= "webhook_service";
 process.env.DB_USER ||= "webhook_user";
 process.env.DB_PASSWORD ||= "webhook_password";
+process.env.WORKER_CONCURRENCY ||= "2";
 
 const { app, startWebhookQueueWorker, stopWebhookQueueWorker } = require("../dist/index.js");
+const WEBHOOK_QUEUE_NAME = "webhook-zip-process";
 
 const pool = new Pool({
   host: process.env.DB_HOST,
@@ -43,6 +45,18 @@ async function hasRequiredTables() {
 
   const row = result.rows[0];
   return Boolean(row.jobs_table && row.files_table && row.accounts_table && row.holdings_table);
+}
+
+async function clearPendingWebhookQueueJobs() {
+  try {
+    await pool.query(
+      `DELETE FROM pgboss.job
+       WHERE name = $1`,
+      [WEBHOOK_QUEUE_NAME]
+    );
+  } catch {
+    // Skip cleanup when pgboss schema is unavailable in the current environment.
+  }
 }
 
 async function waitForCondition(check, timeoutMs = 45000, intervalMs = 500) {
@@ -99,7 +113,9 @@ test("persists files, accounts, and holdings rows after webhook upload", async (
     0
   );
 
+  await clearPendingWebhookQueueJobs();
   await pool.query("DELETE FROM files WHERE client_id = $1", [expectedPayload.client_id]);
+  await pool.query("DELETE FROM jobs WHERE url = $1", [sampleZipUrl]);
 
   await startWebhookQueueWorker();
 
@@ -114,7 +130,7 @@ test("persists files, accounts, and holdings rows after webhook upload", async (
 
   await waitForCondition(async () => {
     const jobResult = await pool.query(
-      `SELECT status
+      `SELECT status, error, retries
        FROM jobs
        WHERE job_id = $1`,
       [response.body.jobId]
@@ -122,6 +138,12 @@ test("persists files, accounts, and holdings rows after webhook upload", async (
 
     if (jobResult.rows.length === 0) {
       return false;
+    }
+
+    if (jobResult.rows[0].status === "error") {
+      throw new Error(
+        `Job entered error status. retries=${jobResult.rows[0].retries}, error=${jobResult.rows[0].error ?? "unknown"}`
+      );
     }
 
     return jobResult.rows[0].status === "complete";

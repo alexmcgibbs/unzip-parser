@@ -37,7 +37,9 @@ function startZipServer(zipPath) {
 
 async function runUnzipperPoolWorker(fileUrl) {
   const workerPath = path.resolve(__dirname, "../dist/workers/unzipperPoolWorker.js");
-  const pool = new FixedThreadPool(1, workerPath);
+  const workerConcurrency = 1;
+  console.log(`[test] Creating unzipper worker pool with concurrency=${workerConcurrency}`);
+  const pool = new FixedThreadPool(workerConcurrency, workerPath);
 
   try {
     return await pool.execute({ fileUrl, jobId: "test-job-id" });

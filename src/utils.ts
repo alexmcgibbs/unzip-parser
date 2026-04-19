@@ -5,7 +5,7 @@ import { getJobRetries, updateJobRetry, updateJobStatus } from "./models/jobs";
 import { registerWorker, stopBoss } from "./pgBoss";
 import { ZipWorkerPayload, ZipWorkerResult } from "./workers/processZipJob";
 
-const DEFAULT_WORKER_CONCURRENCY = Math.max(1, availableParallelism());
+const DEFAULT_WORKER_CONCURRENCY = Math.max(1, Math.min(availableParallelism(), 4));
 export const WEBHOOK_QUEUE_NAME = "webhook-zip-process";
 
 export type WebhookJobData = {
