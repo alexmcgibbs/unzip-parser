@@ -20,54 +20,6 @@ async function readEntryToBuffer(entry: unzipper.Entry): Promise<Buffer> {
   return Buffer.concat(chunks);
 }
 
-async function readAllJsonEntries(zipPath: string): Promise<{
-  entries: ZipEntryResult[];
-  extractedFiles: string[];
-  jsonFilePaths: string[];
-  jsonContentsList: unknown[];
-}> {
-  const zipStream = fs.createReadStream(zipPath).pipe(unzipper.Parse({ forceStream: true }));
-  const entries: ZipEntryResult[] = [];
-  const extractedFiles: string[] = [];
-  const jsonFilePaths: string[] = [];
-  const jsonContentsList: unknown[] = [];
-
-  for await (const entry of zipStream) {
-    const zipEntry: ZipEntryResult = {
-      name: entry.path,
-      size: Number(entry.vars.uncompressedSize ?? 0),
-      compressedSize: Number(entry.vars.compressedSize ?? 0),
-      isDirectory: entry.type === "Directory"
-    };
-
-    entries.push(zipEntry);
-
-    if (!zipEntry.isDirectory) {
-      extractedFiles.push(zipEntry.name);
-    }
-
-    if (!zipEntry.isDirectory && zipEntry.name.toLowerCase().endsWith(".json")) {
-      const jsonBuffer = await readEntryToBuffer(entry);
-      jsonFilePaths.push(zipEntry.name);
-      jsonContentsList.push(JSON.parse(jsonBuffer.toString("utf8")));
-      continue;
-    }
-
-    entry.autodrain();
-  }
-
-  if (jsonFilePaths.length === 0) {
-    throw new Error("No JSON file found in ZIP contents.");
-  }
-
-  return {
-    entries,
-    extractedFiles,
-    jsonFilePaths,
-    jsonContentsList
-  };
-}
-
 (async function run() {
   try {
     const { zipPath, originalFileName } = workerData as WorkerPayload;
@@ -76,7 +28,44 @@ async function readAllJsonEntries(zipPath: string): Promise<{
       throw new Error("ZIP file not found.");
     }
 
-    const { entries, extractedFiles, jsonFilePaths, jsonContentsList } = await readAllJsonEntries(zipPath);
+    const zipStream = fs.createReadStream(zipPath).pipe(unzipper.Parse({ forceStream: true }));
+    const entries: ZipEntryResult[] = [];
+    const extractedFiles: string[] = [];
+    const jsonFilePaths: string[] = [];
+    const persistPromises: Promise<unknown>[] = [];
+
+    for await (const entry of zipStream) {
+      const zipEntry: ZipEntryResult = {
+        name: entry.path,
+        size: Number(entry.vars.uncompressedSize ?? 0),
+        compressedSize: Number(entry.vars.compressedSize ?? 0),
+        isDirectory: entry.type === "Directory"
+      };
+
+      entries.push(zipEntry);
+
+      if (!zipEntry.isDirectory) {
+        extractedFiles.push(zipEntry.name);
+      }
+
+      if (!zipEntry.isDirectory && zipEntry.name.toLowerCase().endsWith(".json")) {
+        const jsonBuffer = await readEntryToBuffer(entry);
+        const jsonContents = JSON.parse(jsonBuffer.toString("utf8"));
+        jsonFilePaths.push(zipEntry.name);
+
+        if (hasDatabaseConfig()) {
+          persistPromises.push(persistWebhookPayload(originalFileName, jsonContents));
+        }
+
+        continue;
+      }
+
+      entry.autodrain();
+    }
+
+    if (jsonFilePaths.length === 0) {
+      throw new Error("No JSON file found in ZIP contents.");
+    }
 
     console.log("Unzipper worker unzip summary:");
     console.log(
@@ -92,11 +81,9 @@ async function readAllJsonEntries(zipPath: string): Promise<{
       )
     );
 
-    if (hasDatabaseConfig()) {
-      for (const jsonContents of jsonContentsList) {
-        await persistWebhookPayload(originalFileName, jsonContents);
-      }
-    } else {
+    if (persistPromises.length > 0) {
+      await Promise.all(persistPromises);
+    } else if (!hasDatabaseConfig()) {
       console.log("Postgres connection not configured. Skipping database write.");
     }
 

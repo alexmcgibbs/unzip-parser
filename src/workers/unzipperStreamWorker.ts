@@ -1,10 +1,8 @@
-import { randomUUID } from "node:crypto";
-import { PassThrough, Transform, TransformCallback, Writable } from "node:stream";
+import { Transform, TransformCallback, Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { parentPort, workerData } from "node:worker_threads";
 import got from "got";
 import { PoolClient } from "pg";
-import { from as copyFrom } from "pg-copy-streams";
 import * as unzipper from "unzipper";
 import { getDbPool, hasDatabaseConfig } from "../db";
 
@@ -51,10 +49,9 @@ type FileHeader = {
   last_updated: string;
 };
 
-type FlatTsvRecord =
-  | { table: "files"; tsv: string }
-  | { table: "accounts"; tsv: string }
-  | { table: "holdings"; tsv: string };
+type HeaderEvent = { type: "header"; data: FileHeader };
+type AccountEvent = { type: "account"; data: AccountPayload };
+type StreamEvent = HeaderEvent | AccountEvent;
 
 interface AssemblerInstance {
   consume(token: JsonToken): void;
@@ -87,36 +84,16 @@ const SCALAR_ROOT_FIELDS = new Set([
   "last_updated"
 ]);
 
-function tsvValue(value: unknown): string {
-  if (value === null || value === undefined) {
-    return "\\N";
-  }
-
-  return String(value)
-    .replace(/\\/g, "\\\\")
-    .replace(/\t/g, "\\t")
-    .replace(/\n/g, "\\n")
-    .replace(/\r/g, "\\r");
-}
-
-function toTsvLine(fields: unknown[]): string {
-  return `${fields.map(tsvValue).join("\t")}\n`;
-}
-
-class HoldingFlattenTransform extends Transform {
-  private readonly jobId: string;
-  private readonly fileName: string;
+class StreamingJsonAccountExtractor extends Transform {
   private state: ParseState = PARSE_STATE.ROOT_FIELDS;
   private header: Partial<FileHeader> = {};
   private currentKey = "";
   private accountAssembler: AssemblerInstance | null = null;
   private accountDepth = 0;
-  private fileRowEmitted = false;
+  private emittedHeader = false;
 
-  constructor(jobId: string, fileName: string) {
+  constructor() {
     super({ objectMode: true });
-    this.jobId = jobId;
-    this.fileName = fileName;
   }
 
   _transform(token: ParserToken, _enc: BufferEncoding, callback: TransformCallback): void {
@@ -141,7 +118,7 @@ class HoldingFlattenTransform extends Transform {
 
       callback();
     } catch (error) {
-      callback(error instanceof Error ? error : new Error("Failed to flatten JSON token stream."));
+      callback(error instanceof Error ? error : new Error("Failed to process JSON token stream."));
     }
   }
 
@@ -151,11 +128,15 @@ class HoldingFlattenTransform extends Transform {
     this.currentKey = "";
     this.accountAssembler = null;
     this.accountDepth = 0;
-    this.fileRowEmitted = false;
+    this.emittedHeader = false;
   }
 
-  private emitFileRow(): void {
-    const requiredKeys: Array<keyof FileHeader> = [
+  private emitHeaderIfNeeded(): void {
+    if (this.emittedHeader) {
+      return;
+    }
+
+    const required: Array<keyof FileHeader> = [
       "client_id",
       "first_name",
       "last_name",
@@ -164,63 +145,14 @@ class HoldingFlattenTransform extends Transform {
       "last_updated"
     ];
 
-    for (const key of requiredKeys) {
+    for (const key of required) {
       if (typeof this.header[key] !== "string") {
         throw new Error(`Missing required JSON root field: ${key}`);
       }
     }
 
-    this.push({
-      table: "files",
-      tsv: toTsvLine([
-        this.jobId,
-        this.fileName,
-        this.header.client_id,
-        this.header.first_name,
-        this.header.last_name,
-        this.header.email,
-        this.header.advisor_id,
-        this.header.last_updated
-      ])
-    } satisfies FlatTsvRecord);
-
-    this.fileRowEmitted = true;
-  }
-
-  private emitAccountAndHoldings(account: AccountPayload): void {
-    this.push({
-      table: "accounts",
-      tsv: toTsvLine([
-        this.jobId,
-        this.header.client_id,
-        account.account_id,
-        account.account_type,
-        account.custodian,
-        account.opened_date,
-        account.status,
-        account.cash_balance,
-        account.total_value
-      ])
-    } satisfies FlatTsvRecord);
-
-    for (const holding of account.holdings) {
-      this.push({
-        table: "holdings",
-        tsv: toTsvLine([
-          this.jobId,
-          this.header.client_id,
-          account.account_id,
-          holding.ticker,
-          holding.cusip,
-          holding.description,
-          holding.quantity,
-          holding.market_value,
-          holding.cost_basis,
-          holding.price,
-          holding.asset_class
-        ])
-      } satisfies FlatTsvRecord);
-    }
+    this.push({ type: "header", data: this.header as FileHeader } satisfies HeaderEvent);
+    this.emittedHeader = true;
   }
 
   private handleRootField(token: JsonToken): void {
@@ -235,16 +167,12 @@ class HoldingFlattenTransform extends Transform {
         break;
       case "startArray":
         if (this.currentKey === "accounts") {
-          if (!this.fileRowEmitted) {
-            this.emitFileRow();
-          }
+          this.emitHeaderIfNeeded();
           this.state = PARSE_STATE.IN_ACCOUNTS_ARRAY;
         }
         break;
       case "endObject":
-        if (!this.fileRowEmitted) {
-          this.emitFileRow();
-        }
+        this.emitHeaderIfNeeded();
         this.state = PARSE_STATE.DONE;
         break;
     }
@@ -274,135 +202,78 @@ class HoldingFlattenTransform extends Transform {
     this.accountAssembler?.consume(token);
 
     if (this.accountDepth === 0 && this.accountAssembler) {
-      this.emitAccountAndHoldings(this.accountAssembler.current as AccountPayload);
+      this.push({ type: "account", data: this.accountAssembler.current as AccountPayload } satisfies AccountEvent);
       this.accountAssembler = null;
       this.state = PARSE_STATE.IN_ACCOUNTS_ARRAY;
     }
   }
 }
 
-class CopyDispatchWritable extends Writable {
-  private readonly filesStream: PassThrough;
-  private readonly accountsStream: PassThrough;
-  private readonly holdingsStream: PassThrough;
+class DirectPersistenceWritable extends Writable {
+  private readonly client: PoolClient;
+  private readonly fileName: string;
+  private currentClientId: string | null = null;
 
-  constructor(filesStream: PassThrough, accountsStream: PassThrough, holdingsStream: PassThrough) {
+  constructor(client: PoolClient, fileName: string) {
     super({ objectMode: true });
-    this.filesStream = filesStream;
-    this.accountsStream = accountsStream;
-    this.holdingsStream = holdingsStream;
+    this.client = client;
+    this.fileName = fileName;
   }
 
-  _write(record: FlatTsvRecord, _enc: BufferEncoding, callback: (error?: Error | null) => void): void {
-    const target =
-      record.table === "files"
-        ? this.filesStream
-        : record.table === "accounts"
-          ? this.accountsStream
-          : this.holdingsStream;
+  _write(event: StreamEvent, _enc: BufferEncoding, callback: (error?: Error | null) => void): void {
+    this.persistEvent(event).then(() => callback()).catch((error) => {
+      callback(error instanceof Error ? error : new Error("Failed to persist stream event."));
+    });
+  }
 
-    if (target.write(record.tsv)) {
-      callback();
+  private async persistEvent(event: StreamEvent): Promise<void> {
+    if (event.type === "header") {
+      const header = event.data;
+      this.currentClientId = header.client_id;
+
+      await this.client.query(
+        `INSERT INTO files (
+           file_name,
+           client_id,
+           first_name,
+           last_name,
+           email,
+           advisor_id,
+           last_updated
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+         ON CONFLICT (client_id)
+         DO UPDATE SET
+           file_name = EXCLUDED.file_name,
+           first_name = EXCLUDED.first_name,
+           last_name = EXCLUDED.last_name,
+           email = EXCLUDED.email,
+           advisor_id = EXCLUDED.advisor_id,
+           last_updated = EXCLUDED.last_updated,
+           updated_at = NOW()`,
+        [
+          this.fileName,
+          header.client_id,
+          header.first_name,
+          header.last_name,
+          header.email,
+          header.advisor_id,
+          header.last_updated
+        ]
+      );
+
+      await this.client.query("DELETE FROM accounts WHERE client_id = $1", [header.client_id]);
       return;
     }
 
-    target.once("drain", callback);
-  }
-}
+    if (!this.currentClientId) {
+      throw new Error("Received account data before file header.");
+    }
 
-async function ensureStagingTables(client: PoolClient): Promise<void> {
-  await client.query(
-    `CREATE TABLE IF NOT EXISTS ingest_files_stage (
-       job_id TEXT NOT NULL,
-       file_name TEXT NOT NULL,
-       client_id TEXT NOT NULL,
-       first_name TEXT NOT NULL,
-       last_name TEXT NOT NULL,
-       email TEXT NOT NULL,
-       advisor_id TEXT NOT NULL,
-       last_updated TIMESTAMPTZ NOT NULL
-     );
-     CREATE TABLE IF NOT EXISTS ingest_accounts_stage (
-       job_id TEXT NOT NULL,
-       client_id TEXT NOT NULL,
-       account_id TEXT NOT NULL,
-       account_type TEXT NOT NULL,
-       custodian TEXT NOT NULL,
-       opened_date DATE NOT NULL,
-       status TEXT NOT NULL,
-       cash_balance NUMERIC(18, 2) NOT NULL,
-       total_value NUMERIC(18, 2) NOT NULL
-     );
-     CREATE TABLE IF NOT EXISTS ingest_holdings_stage (
-       job_id TEXT NOT NULL,
-       client_id TEXT NOT NULL,
-       account_id TEXT NOT NULL,
-       ticker TEXT NOT NULL,
-       cusip TEXT,
-       description TEXT,
-       quantity NUMERIC(18, 6) NOT NULL,
-       market_value NUMERIC(18, 2) NOT NULL,
-       cost_basis NUMERIC(18, 2) NOT NULL,
-       price NUMERIC(18, 6) NOT NULL,
-       asset_class TEXT
-     );
-     CREATE INDEX IF NOT EXISTS ingest_files_stage_job_id_idx ON ingest_files_stage(job_id);
-     CREATE INDEX IF NOT EXISTS ingest_accounts_stage_job_id_idx ON ingest_accounts_stage(job_id);
-     CREATE INDEX IF NOT EXISTS ingest_holdings_stage_job_id_idx ON ingest_holdings_stage(job_id);`
-  );
-}
+    const account = event.data;
 
-async function mergeStagingIntoNormalizedTables(client: PoolClient, jobId: string): Promise<void> {
-  await client.query("BEGIN");
-
-  try {
-    await client.query(
-      `INSERT INTO files (
-         file_name,
-         client_id,
-         first_name,
-         last_name,
-         email,
-         advisor_id,
-         last_updated
-       )
-       SELECT DISTINCT
-         s.file_name,
-         s.client_id,
-         s.first_name,
-         s.last_name,
-         s.email,
-         s.advisor_id,
-         s.last_updated
-       FROM ingest_files_stage s
-       WHERE s.job_id = $1
-       ON CONFLICT (client_id)
-       DO UPDATE SET
-         file_name = EXCLUDED.file_name,
-         first_name = EXCLUDED.first_name,
-         last_name = EXCLUDED.last_name,
-         email = EXCLUDED.email,
-         advisor_id = EXCLUDED.advisor_id,
-         last_updated = EXCLUDED.last_updated,
-         updated_at = NOW()`,
-      [jobId]
-    );
-
-    await client.query(
-      `DELETE FROM accounts a
-       USING files f
-       WHERE a.file_id = f.id
-         AND f.client_id IN (
-           SELECT DISTINCT client_id
-           FROM ingest_files_stage
-           WHERE job_id = $1
-         )`,
-      [jobId]
-    );
-
-    await client.query(
+    await this.client.query(
       `INSERT INTO accounts (
-         file_id,
+         client_id,
          account_id,
          account_type,
          custodian,
@@ -410,62 +281,68 @@ async function mergeStagingIntoNormalizedTables(client: PoolClient, jobId: strin
          status,
          cash_balance,
          total_value
-       )
-       SELECT
-         f.id,
-         a.account_id,
-         a.account_type,
-         a.custodian,
-         a.opened_date,
-         a.status,
-         a.cash_balance,
-         a.total_value
-       FROM ingest_accounts_stage a
-       JOIN files f ON f.client_id = a.client_id
-       WHERE a.job_id = $1`,
-      [jobId]
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       ON CONFLICT (account_id)
+       DO UPDATE SET
+         client_id = EXCLUDED.client_id,
+         account_type = EXCLUDED.account_type,
+         custodian = EXCLUDED.custodian,
+         opened_date = EXCLUDED.opened_date,
+         status = EXCLUDED.status,
+         cash_balance = EXCLUDED.cash_balance,
+         total_value = EXCLUDED.total_value,
+         updated_at = NOW()`,
+      [
+        this.currentClientId,
+        account.account_id,
+        account.account_type,
+        account.custodian,
+        account.opened_date,
+        account.status,
+        account.cash_balance,
+        account.total_value
+      ]
     );
 
-    await client.query(
-      `INSERT INTO holdings (
-         account_id,
-         ticker,
-         cusip,
-         description,
-         quantity,
-         market_value,
-         cost_basis,
-         price,
-         asset_class
-       )
-       SELECT
-         a.id,
-         h.ticker,
-         h.cusip,
-         h.description,
-         h.quantity,
-         h.market_value,
-         h.cost_basis,
-         h.price,
-         h.asset_class
-       FROM ingest_holdings_stage h
-       JOIN files f ON f.client_id = h.client_id
-       JOIN accounts a ON a.file_id = f.id AND a.account_id = h.account_id
-       WHERE h.job_id = $1`,
-      [jobId]
-    );
+    await this.client.query("DELETE FROM holdings WHERE account_id = $1", [account.account_id]);
 
-    await client.query("COMMIT");
-  } catch (error) {
-    await client.query("ROLLBACK");
-    throw error;
+    if (account.holdings.length > 0) {
+      await this.client.query(
+        `INSERT INTO holdings (
+           account_id,
+           ticker,
+           cusip,
+           description,
+           quantity,
+           market_value,
+           cost_basis,
+           price,
+           asset_class
+         )
+         SELECT
+           $1,
+           unnest($2::text[]),
+           unnest($3::text[]),
+           unnest($4::text[]),
+           unnest($5::numeric[]),
+           unnest($6::numeric[]),
+           unnest($7::numeric[]),
+           unnest($8::numeric[]),
+           unnest($9::text[])`,
+        [
+          account.account_id,
+          account.holdings.map((h) => h.ticker),
+          account.holdings.map((h) => h.cusip),
+          account.holdings.map((h) => h.description),
+          account.holdings.map((h) => h.quantity),
+          account.holdings.map((h) => h.market_value),
+          account.holdings.map((h) => h.cost_basis),
+          account.holdings.map((h) => h.price),
+          account.holdings.map((h) => h.asset_class)
+        ]
+      );
+    }
   }
-}
-
-async function cleanupStaging(client: PoolClient, jobId: string): Promise<void> {
-  await client.query("DELETE FROM ingest_holdings_stage WHERE job_id = $1", [jobId]);
-  await client.query("DELETE FROM ingest_accounts_stage WHERE job_id = $1", [jobId]);
-  await client.query("DELETE FROM ingest_files_stage WHERE job_id = $1", [jobId]);
 }
 
 function originalFileNameFromUrl(downloadUrl: string): string {
@@ -478,13 +355,9 @@ function originalFileNameFromUrl(downloadUrl: string): string {
   }
 }
 
-async function streamZipToConcurrentCopy(
+async function streamZipToPersistence(
   downloadUrl: string,
-  originalFileName: string,
-  jobId: string,
-  filesInput: PassThrough,
-  accountsInput: PassThrough,
-  holdingsInput: PassThrough
+  sink: DirectPersistenceWritable
 ): Promise<void> {
   await pipeline(
     got.stream(downloadUrl),
@@ -504,23 +377,19 @@ async function streamZipToConcurrentCopy(
         }
       }
     },
-    new HoldingFlattenTransform(jobId, originalFileName),
-    new CopyDispatchWritable(filesInput, accountsInput, holdingsInput)
+    new StreamingJsonAccountExtractor(),
+    sink
   );
 }
 
 (async function run() {
-  const jobId = randomUUID();
   if (!hasDatabaseConfig()) {
     parentPort?.postMessage({ error: "Postgres connection not configured." });
     process.exit(1);
   }
 
   const pool = getDbPool();
-  const filesClient = await pool.connect();
-  const accountsClient = await pool.connect();
-  const holdingsClient = await pool.connect();
-  const mergeClient = await pool.connect();
+  const client = await pool.connect();
 
   try {
     const { downloadUrl, originalFileName } = workerData as WorkerPayload;
@@ -530,107 +399,22 @@ async function streamZipToConcurrentCopy(
 
     const fileName = originalFileName ?? originalFileNameFromUrl(downloadUrl);
 
-    await ensureStagingTables(mergeClient);
-
-    const filesInput = new PassThrough();
-    const accountsInput = new PassThrough();
-    const holdingsInput = new PassThrough();
-
-    const filesCopyPromise = pipeline(
-      filesInput,
-      filesClient.query(
-        copyFrom(
-          `COPY ingest_files_stage (
-             job_id,
-             file_name,
-             client_id,
-             first_name,
-             last_name,
-             email,
-             advisor_id,
-             last_updated
-           ) FROM STDIN WITH (FORMAT text)`
-        )
-      )
-    );
-
-    const accountsCopyPromise = pipeline(
-      accountsInput,
-      accountsClient.query(
-        copyFrom(
-          `COPY ingest_accounts_stage (
-             job_id,
-             client_id,
-             account_id,
-             account_type,
-             custodian,
-             opened_date,
-             status,
-             cash_balance,
-             total_value
-           ) FROM STDIN WITH (FORMAT text)`
-        )
-      )
-    );
-
-    const holdingsCopyPromise = pipeline(
-      holdingsInput,
-      holdingsClient.query(
-        copyFrom(
-          `COPY ingest_holdings_stage (
-             job_id,
-             client_id,
-             account_id,
-             ticker,
-             cusip,
-             description,
-             quantity,
-             market_value,
-             cost_basis,
-             price,
-             asset_class
-           ) FROM STDIN WITH (FORMAT text)`
-        )
-      )
-    );
-
+    await client.query("BEGIN");
     try {
-      await streamZipToConcurrentCopy(
-        downloadUrl,
-        fileName,
-        jobId,
-        filesInput,
-        accountsInput,
-        holdingsInput
-      );
-    } finally {
-      filesInput.end();
-      accountsInput.end();
-      holdingsInput.end();
+      await streamZipToPersistence(downloadUrl, new DirectPersistenceWritable(client, fileName));
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
     }
 
-    await Promise.all([filesCopyPromise, accountsCopyPromise, holdingsCopyPromise]);
-
-    await mergeStagingIntoNormalizedTables(mergeClient, jobId);
-    await cleanupStaging(mergeClient, jobId);
-
-    parentPort?.postMessage({ ok: true, jobId });
+    parentPort?.postMessage({ ok: true });
     process.exit(0);
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown worker error";
-
-    try {
-      await cleanupStaging(mergeClient, jobId);
-    } catch {
-      // Best-effort cleanup.
-    }
-
     parentPort?.postMessage({ error: message });
     process.exit(1);
   } finally {
-    filesClient.release();
-    accountsClient.release();
-    holdingsClient.release();
-    mergeClient.release();
+    client.release();
   }
 })();

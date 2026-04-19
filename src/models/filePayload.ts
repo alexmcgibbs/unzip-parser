@@ -9,7 +9,7 @@ export async function persistWebhookPayload(fileName: string, payload: unknown):
   try {
     await client.query("BEGIN");
 
-    const fileInsertResult = await client.query<{ id: number }>(
+    await client.query(
       `INSERT INTO files (
         file_name,
         client_id,
@@ -27,8 +27,7 @@ export async function persistWebhookPayload(fileName: string, payload: unknown):
         email = EXCLUDED.email,
         advisor_id = EXCLUDED.advisor_id,
         last_updated = EXCLUDED.last_updated,
-        updated_at = NOW()
-      RETURNING id`,
+        updated_at = NOW()`,
       [
         fileName,
         parsed.client_id,
@@ -40,17 +39,15 @@ export async function persistWebhookPayload(fileName: string, payload: unknown):
       ]
     );
 
-    const fileId = fileInsertResult.rows[0].id;
-
-    await client.query("DELETE FROM accounts WHERE file_id = $1", [fileId]);
+    await client.query("DELETE FROM accounts WHERE client_id = $1", [parsed.client_id]);
 
     let accountsInserted = 0;
     let holdingsInserted = 0;
 
     for (const account of parsed.accounts) {
-      const accountInsertResult = await client.query<{ id: number }>(
+      await client.query(
         `INSERT INTO accounts (
-          file_id,
+          client_id,
           account_id,
           account_type,
           custodian,
@@ -59,9 +56,18 @@ export async function persistWebhookPayload(fileName: string, payload: unknown):
           cash_balance,
           total_value
         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        RETURNING id`,
+        ON CONFLICT (account_id)
+        DO UPDATE SET
+          client_id = EXCLUDED.client_id,
+          account_type = EXCLUDED.account_type,
+          custodian = EXCLUDED.custodian,
+          opened_date = EXCLUDED.opened_date,
+          status = EXCLUDED.status,
+          cash_balance = EXCLUDED.cash_balance,
+          total_value = EXCLUDED.total_value,
+          updated_at = NOW()`,
         [
-          fileId,
+          parsed.client_id,
           account.account_id,
           account.account_type,
           account.custodian,
@@ -72,10 +78,9 @@ export async function persistWebhookPayload(fileName: string, payload: unknown):
         ]
       );
 
-      const accountRowId = accountInsertResult.rows[0].id;
       accountsInserted += 1;
 
-      for (const holding of account.holdings) {
+      if (account.holdings.length > 0) {
         await client.query(
           `INSERT INTO holdings (
             account_id,
@@ -87,26 +92,36 @@ export async function persistWebhookPayload(fileName: string, payload: unknown):
             cost_basis,
             price,
             asset_class
-          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+          )
+          SELECT
+            $1,
+            unnest($2::text[]),
+            unnest($3::text[]),
+            unnest($4::text[]),
+            unnest($5::numeric[]),
+            unnest($6::numeric[]),
+            unnest($7::numeric[]),
+            unnest($8::numeric[]),
+            unnest($9::text[])`,
           [
-            accountRowId,
-            holding.ticker,
-            holding.cusip,
-            holding.description,
-            holding.quantity,
-            holding.market_value,
-            holding.cost_basis,
-            holding.price,
-            holding.asset_class
+            account.account_id,
+            account.holdings.map((h) => h.ticker),
+            account.holdings.map((h) => h.cusip),
+            account.holdings.map((h) => h.description),
+            account.holdings.map((h) => h.quantity),
+            account.holdings.map((h) => h.market_value),
+            account.holdings.map((h) => h.cost_basis),
+            account.holdings.map((h) => h.price),
+            account.holdings.map((h) => h.asset_class)
           ]
         );
-        holdingsInserted += 1;
+        holdingsInserted += account.holdings.length;
       }
     }
 
     await client.query("COMMIT");
 
-    return { fileId, accountsInserted, holdingsInserted };
+    return { clientId: parsed.client_id, accountsInserted, holdingsInserted };
   } catch (error) {
     await client.query("ROLLBACK");
     throw error;

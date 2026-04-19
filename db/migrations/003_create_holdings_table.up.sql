@@ -1,6 +1,6 @@
 CREATE TABLE IF NOT EXISTS holdings (
   id BIGSERIAL PRIMARY KEY,
-  account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  account_id TEXT NOT NULL REFERENCES accounts(account_id) ON DELETE CASCADE,
   ticker TEXT NOT NULL,
   cusip TEXT,
   description TEXT,

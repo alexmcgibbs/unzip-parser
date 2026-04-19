@@ -52,7 +52,7 @@ export type FilePayload = {
 };
 
 export type PersistenceSummary = {
-  fileId: number;
+  clientId: string;
   accountsInserted: number;
   holdingsInserted: number;
 };

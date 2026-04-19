@@ -16,8 +16,6 @@
     "got": "^11.8.6",
     "multer": "^1.4.5-lts.2",
     "pg": "^8.13.3",
-    "pg-copy-streams": "^7.0.0",
-    "stream-json": "^2.1.0",
     "unzipper": "^0.12.3"
   },
   "devDependencies": {
@@ -26,7 +24,6 @@
     "@types/multer": "^1.4.12",
     "@types/node": "^22.13.10",
     "@types/pg": "^8.11.10",
-    "@types/pg-copy-streams": "^1.2.5",
     "@types/unzipper": "^0.10.11",
     "supertest": "^7.1.1",
     "typescript": "^5.8.2"

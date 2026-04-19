@@ -1,7 +1,6 @@
 CREATE TABLE IF NOT EXISTS files (
-  id BIGSERIAL PRIMARY KEY,
   file_name TEXT NOT NULL,
-  client_id TEXT NOT NULL,
+  client_id TEXT NOT NULL PRIMARY KEY,
   first_name TEXT NOT NULL,
   last_name TEXT NOT NULL,
   email TEXT NOT NULL,
