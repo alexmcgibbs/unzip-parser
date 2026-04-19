@@ -51,16 +51,25 @@ export async function enqueueJob<T extends object>(queueName: string, data: T): 
 
 export async function registerWorker<T extends object>(
   queueName: string,
-  handler: (data: T) => Promise<void>
+  handler: (data: T) => Promise<void>,
+  concurrency = 1
 ): Promise<void> {
   const instance = await getBoss();
   await instance.createQueue(queueName);
 
-  await instance.work(queueName, async (jobs) => {
-    for (const job of jobs) {
-      await handler(job.data as T);
-    }
-  });
+  const registrations: Promise<string>[] = [];
+
+  for (let i = 0; i < concurrency; i += 1) {
+    registrations.push(
+      instance.work(queueName, { batchSize: 1 }, async (jobs) => {
+        for (const job of jobs) {
+          await handler(job.data as T);
+        }
+      })
+    );
+  }
+
+  await Promise.all(registrations);
 }
 
 export async function stopBoss(): Promise<void> {

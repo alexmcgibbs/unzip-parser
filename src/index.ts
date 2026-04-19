@@ -1,134 +1,14 @@
 import express, { Request, Response } from "express";
 import path from "node:path";
-import { availableParallelism } from "node:os";
-import { FixedThreadPool } from "poolifier";
 import { hasDatabaseConfig, testDatabaseConnection } from "./db";
-import { createQueuedJob, getJobDetails, getJobRetries, updateJobRetry, updateJobStatus, updateJobPgbossId } from "./models/jobs";
-import { enqueueJob, registerWorker, stopBoss } from "./pgBoss";
-import { ZipWorkerPayload, ZipWorkerResult } from "./workers/processZipJob";
+import { createQueuedJob, getJobDetails, updateJobStatus, updateJobPgbossId } from "./models/jobs";
+import { enqueueJob } from "./pgBoss";
+import { startWebhookQueueWorker, stopWebhookQueueWorker, WEBHOOK_QUEUE_NAME, WebhookJobData } from "./utils";
 
 const app = express();
 app.use(express.json());
 
 const port = Number(process.env.PORT) || 3000;
-const WEBHOOK_QUEUE_NAME = "webhook-zip-process";
-
-type WebhookJobData = {
-  jobId: string;
-  fileUrl: string;
-};
-
-let queueWorkerStarted = false;
-let unzipWorkerPool: FixedThreadPool<ZipWorkerPayload, ZipWorkerResult> | null = null;
-
-function getUnzipWorkerPool(): FixedThreadPool<ZipWorkerPayload, ZipWorkerResult> {
-  if (unzipWorkerPool) {
-    return unzipWorkerPool;
-  }
-
-  const poolSize = Math.max(1, availableParallelism());
-  const workerPath = path.resolve(__dirname, "workers", "unzipperPoolWorker.js");
-  unzipWorkerPool = new FixedThreadPool<ZipWorkerPayload, ZipWorkerResult>(poolSize, workerPath);
-  console.log(`Initialized unzip worker pool with ${poolSize} threads.`);
-  return unzipWorkerPool;
-}
-
-function isRetryableError(error: unknown): boolean {
-  if (!(error instanceof Error)) {
-    return false;
-  }
-
-  const message = error.message.toLowerCase();
-  const code = (error as NodeJS.ErrnoException).code;
-
-  // Network-related errors
-  const networkErrors = [
-    "ECONNREFUSED",
-    "ECONNRESET",
-    "ENOTFOUND",
-    "ETIMEDOUT",
-    "EHOSTUNREACH",
-    "ENETUNREACH",
-    "EPIPE"
-  ];
-  if (networkErrors.includes(code ?? "")) {
-    return true;
-  }
-
-  // Message-based detection for connection/timeout issues
-  const retryablePatterns = [
-    "connection",
-    "timeout",
-    "temporarily unavailable",
-    "too many connections",
-    "database connection",
-    "unable to reach",
-    "network",
-    "socket"
-  ];
-  if (retryablePatterns.some((pattern) => message.includes(pattern))) {
-    return true;
-  }
-
-  return false;
-}
-
-function unzipInUrlWorker(fileUrl: string, jobId: string): Promise<void> {
-  const pool = getUnzipWorkerPool();
-  return pool.execute({ fileUrl, jobId }).then(() => undefined);
-}
-
-async function processWebhookJob(data: WebhookJobData): Promise<void> {
-  await updateJobStatus(data.jobId, "started", null);
-
-  try {
-    await unzipInUrlWorker(data.fileUrl, data.jobId);
-    await updateJobStatus(data.jobId, "complete", null);
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : "Unknown worker error";
-
-    if (isRetryableError(error)) {
-      // For retryable errors, increment retry count and reset status to queued
-      // pg-boss will automatically retry this job
-      const currentRetries = await getJobRetries(data.jobId);
-      await updateJobRetry(data.jobId, currentRetries + 1);
-      console.log(
-        `Retryable error on job ${data.jobId} (retries: ${currentRetries + 1}/3): ${errorMessage}`
-      );
-      // Re-throw so pg-boss handles the retry
-      throw error;
-    } else {
-      // Fatal error; mark as failed and do not retry
-      await updateJobStatus(data.jobId, "error", errorMessage);
-      console.log(`Fatal error on job ${data.jobId}: ${errorMessage}`);
-    }
-  }
-}
-
-async function startWebhookQueueWorker(): Promise<void> {
-  if (queueWorkerStarted) {
-    return;
-  }
-
-  getUnzipWorkerPool();
-
-  await registerWorker<WebhookJobData>(WEBHOOK_QUEUE_NAME, async (jobData) => {
-    await processWebhookJob(jobData);
-  });
-
-  queueWorkerStarted = true;
-  console.log(`Registered pg-boss worker for queue: ${WEBHOOK_QUEUE_NAME}`);
-}
-
-async function stopWebhookQueueWorker(): Promise<void> {
-  if (unzipWorkerPool) {
-    await unzipWorkerPool.destroy();
-    unzipWorkerPool = null;
-  }
-
-  await stopBoss();
-  queueWorkerStarted = false;
-}
 
 app.get("/", (_req: Request, res: Response) => {
   res.json({
