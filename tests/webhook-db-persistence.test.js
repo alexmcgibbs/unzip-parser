@@ -78,6 +78,8 @@ test("persists files, accounts, and holdings rows after webhook upload", async (
     .attach("file", sampleZipPath)
     .expect(200);
 
+  assert.equal(response.body.message, "ZIP received, processed, and persisted successfully.");
+
   const fileCountResult = await pool.query(
     `SELECT COUNT(*)::int AS total
      FROM files
@@ -137,15 +139,6 @@ test("persists files, accounts, and holdings rows after webhook upload", async (
   );
 
   assert.equal(holdingsCountResult.rows[0].total, expectedHoldingsCount);
-
-  const extractedTo = response.body.result?.extractedTo;
-  const archivePath = response.body.result?.archivePath;
-  if (archivePath && fs.existsSync(archivePath)) {
-    fs.rmSync(archivePath, { force: true });
-  }
-  if (extractedTo && fs.existsSync(extractedTo)) {
-    fs.rmSync(extractedTo, { recursive: true, force: true });
-  }
 
   await pool.query("DELETE FROM files WHERE id = $1", [fileRow.id]);
 });

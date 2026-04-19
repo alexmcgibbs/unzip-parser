@@ -11,9 +11,9 @@
   },
   "dependencies": {
     "adm-zip": "^0.5.16",
-    "busboy": "^1.6.0",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
+    "got": "^11.8.6",
     "multer": "^1.4.5-lts.2",
     "pg": "^8.13.3",
     "pg-copy-streams": "^7.0.0",
@@ -22,7 +22,6 @@
   },
   "devDependencies": {
     "@types/adm-zip": "^0.5.8",
-    "@types/busboy": "^1.5.4",
     "@types/express": "^4.17.21",
     "@types/multer": "^1.4.12",
     "@types/node": "^22.13.10",

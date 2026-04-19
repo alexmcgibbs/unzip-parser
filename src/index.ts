@@ -4,10 +4,7 @@ import path from "node:path";
 import fs from "node:fs";
 import { Worker } from "node:worker_threads";
 import { hasDatabaseConfig, testDatabaseConnection } from "./db";
-import { WorkerSuccess, WorkerError, PersistenceSummary } from "./types";
-import { persistWebhookPayload } from "./models/filePayload";
-import { registerStreamingRoute } from "./streamingRoute";
-import { registerFullStreamingRoute } from "./fullStreamingRoute";
+import { WorkerError } from "./types";
 
 const app = express();
 const port = Number(process.env.PORT) || 3000;
@@ -68,22 +65,20 @@ const largeFileLimit = parseSizeLimit(
   "50mb"
 );
 const upload = multer({ storage, limits: { fileSize: fileLimit } });
-registerStreamingRoute(app, { fileLimit, uploadsDir });
-registerFullStreamingRoute(app, { fileLimit });
 
-function runWorker(workerFileName: string, zipPath: string): Promise<WorkerSuccess> {
+function runWorker(workerFileName: string, zipPath: string, originalFileName: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const workerPath = path.resolve(__dirname, "workers", workerFileName);
     const worker = new Worker(workerPath, {
-      workerData: { zipPath }
+      workerData: { zipPath, originalFileName }
     });
 
-    worker.once("message", (data: WorkerSuccess | WorkerError) => {
+    worker.once("message", (data: { ok: true } | WorkerError) => {
       if ("error" in data) {
         reject(new Error(data.error));
         return;
       }
-      resolve(data);
+      resolve();
     });
 
     worker.once("error", (err) => {
@@ -98,12 +93,12 @@ function runWorker(workerFileName: string, zipPath: string): Promise<WorkerSucce
   });
 }
 
-function unzipInWorker(zipPath: string): Promise<WorkerSuccess> {
-  return runWorker("unzipWorker.js", zipPath);
+function unzipInWorker(zipPath: string, originalFileName: string): Promise<void> {
+  return runWorker("unzipWorker.js", zipPath, originalFileName);
 }
 
-function unzipInLargeWorker(zipPath: string): Promise<WorkerSuccess> {
-  return runWorker("largeUnzipWorker.js", zipPath);
+function unzipInLargeWorker(zipPath: string, originalFileName: string): Promise<void> {
+  return runWorker("largeUnzipWorker.js", zipPath, originalFileName);
 }
 
 function isUnzipUnavailableError(error: unknown): boolean {
@@ -114,26 +109,30 @@ function isUnzipUnavailableError(error: unknown): boolean {
   return error.message.includes("spawn unzip ENOENT");
 }
 
-async function processZipFile(zipPath: string, uploadedFileSize: number): Promise<WorkerSuccess> {
+async function processZipFile(
+  zipPath: string,
+  uploadedFileSize: number,
+  originalFileName: string
+): Promise<void> {
   if (uploadedFileSize <= largeFileLimit) {
     console.log(
       `Selected worker: unzipWorker (file size: ${uploadedFileSize} bytes, threshold: ${largeFileLimit} bytes)`
     );
-    return unzipInWorker(zipPath);
+    return unzipInWorker(zipPath, originalFileName);
   }
 
   try {
     console.log(
       `Selected worker: largeUnzipWorker (file size: ${uploadedFileSize} bytes, threshold: ${largeFileLimit} bytes)`
     );
-    return await unzipInLargeWorker(zipPath);
+    return await unzipInLargeWorker(zipPath, originalFileName);
   } catch (error) {
     if (!isUnzipUnavailableError(error)) {
       throw error;
     }
 
     console.warn("unzip binary is unavailable. Falling back to unzipWorker.");
-    return unzipInWorker(zipPath);
+    return unzipInWorker(zipPath, originalFileName);
   }
 }
 
@@ -170,7 +169,6 @@ app.get("/", (_req: Request, res: Response) => {
 
 app.post("/webhook", upload.single("file"), async (req: Request, res: Response) => {
   let archivePathToDelete: string | undefined;
-  let extractedToDelete: string | undefined;
 
   try {
     if (!req.file) {
@@ -186,24 +184,10 @@ app.post("/webhook", upload.single("file"), async (req: Request, res: Response) 
     }
 
     const uploadedFileSize = fs.statSync(req.file.path).size;
-    const result = await processZipFile(req.file.path, uploadedFileSize);
-    extractedToDelete = result.extractedTo;
-
-    let dbWrite: PersistenceSummary | null = null;
-    if (hasDatabaseConfig()) {
-      dbWrite = await persistWebhookPayload(req.file.originalname, result.jsonContents);
-    } else {
-      console.log("Postgres connection not configured. Skipping database write.");
-    }
-
-    console.log("ZIP processing result:");
-    console.log(JSON.stringify(result, null, 2));
-    console.log("Database write summary:", dbWrite);
+    await processZipFile(req.file.path, uploadedFileSize, req.file.originalname);
 
     res.status(200).json({
-      message: "ZIP received and processed successfully.",
-      jsonContents: result.jsonContents,
-      result
+      message: "ZIP received, processed, and persisted successfully."
     });
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : "Unknown error";
@@ -214,7 +198,7 @@ app.post("/webhook", upload.single("file"), async (req: Request, res: Response) 
       details: errorMessage
     });
   } finally {
-    void cleanupArtifacts(archivePathToDelete, extractedToDelete);
+    void cleanupArtifacts(archivePathToDelete);
   }
 });
 

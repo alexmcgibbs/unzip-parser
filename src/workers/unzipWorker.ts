@@ -1,7 +1,8 @@
 import fs from "node:fs";
-import path from "node:path";
 import { parentPort, workerData } from "node:worker_threads";
 import AdmZip from "adm-zip";
+import { hasDatabaseConfig } from "../db";
+import { persistWebhookPayload } from "../models/filePayload";
 
 type ZipEntryResult = {
   name: string;
@@ -12,45 +13,22 @@ type ZipEntryResult = {
 
 type WorkerPayload = {
   zipPath: string;
+  originalFileName: string;
 };
 
-function findFirstJsonFile(rootDir: string): string {
-  const files = collectFiles(rootDir);
-  const jsonFile = files.find((file) => file.toLowerCase().endsWith(".json"));
+function findFirstJsonEntry(entries: ZipEntryResult[]): ZipEntryResult {
+  const jsonEntry = entries.find((entry) => !entry.isDirectory && entry.name.toLowerCase().endsWith(".json"));
 
-  if (!jsonFile) {
-    throw new Error("No JSON file found in extracted ZIP contents.");
+  if (!jsonEntry) {
+    throw new Error("No JSON file found in ZIP contents.");
   }
 
-  return path.join(rootDir, jsonFile);
+  return jsonEntry;
 }
 
-function collectFiles(rootDir: string): string[] {
-  const output: string[] = [];
-
-  function walk(current: string): void {
-    const entries = fs.readdirSync(current, { withFileTypes: true });
-
-    for (const entry of entries) {
-      const fullPath = path.join(current, entry.name);
-      if (entry.isDirectory()) {
-        walk(fullPath);
-      } else {
-        output.push(path.relative(rootDir, fullPath));
-      }
-    }
-  }
-
-  if (fs.existsSync(rootDir)) {
-    walk(rootDir);
-  }
-
-  return output;
-}
-
-(function run() {
+(async function run() {
   try {
-    const { zipPath } = workerData as WorkerPayload;
+    const { zipPath, originalFileName } = workerData as WorkerPayload;
 
     if (!zipPath || !fs.existsSync(zipPath)) {
       throw new Error("ZIP file not found.");
@@ -64,37 +42,43 @@ function collectFiles(rootDir: string): string[] {
       isDirectory: entry.isDirectory
     }));
 
-    const extractedRoot = path.resolve(process.cwd(), "uploads", "extracted");
-    if (!fs.existsSync(extractedRoot)) {
-      fs.mkdirSync(extractedRoot, { recursive: true });
+    const extractedFiles = entries.filter((entry) => !entry.isDirectory).map((entry) => entry.name);
+    const jsonEntry = findFirstJsonEntry(entries);
+    const rawJson = zip.readAsText(jsonEntry.name, "utf8");
+    const jsonContents = JSON.parse(rawJson);
+
+    console.log("Worker unzip summary:");
+    console.log(
+      JSON.stringify(
+        {
+          archivePath: zipPath,
+          totalEntries: entries.length,
+          extractedFiles,
+          jsonFilePath: jsonEntry.name
+        },
+        null,
+        2
+      )
+    );
+
+    if (hasDatabaseConfig()) {
+      await persistWebhookPayload(originalFileName, jsonContents);
+    } else {
+      console.log("Postgres connection not configured. Skipping database write.");
     }
 
-    const folderName = `${path.basename(zipPath, ".zip")}_${Date.now()}`;
-    const extractedTo = path.join(extractedRoot, folderName);
-    fs.mkdirSync(extractedTo, { recursive: true });
-
-    zip.extractAllTo(extractedTo, true);
-
-    const extractedFiles = collectFiles(extractedTo);
-    const extractedJsonPath = findFirstJsonFile(extractedTo);
-    const jsonContents = JSON.parse(fs.readFileSync(extractedJsonPath, "utf8"));
-
-    const result = {
-      archivePath: zipPath,
-      extractedTo,
-      totalEntries: entries.length,
-      entries,
-      extractedFiles,
-      jsonFilePath: extractedJsonPath,
-      jsonContents
-    };
-
-    console.log("Worker unzip result:");
-    console.log(JSON.stringify(result, null, 2));
-
-    parentPort?.postMessage(result);
+    parentPort?.postMessage({ ok: true });
+    fs.rm(zipPath, { force: true }, (error) => {
+      if (error) {
+        const message = error instanceof Error ? error.message : "Unknown cleanup error";
+        console.warn(`Failed to remove uploaded archive ${zipPath}: ${message}`);
+      }
+      process.exit(0);
+    });
+    return;
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown worker error";
     parentPort?.postMessage({ error: message });
+    process.exit(1);
   }
 })();

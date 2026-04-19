@@ -2,10 +2,13 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { parentPort, workerData } from "node:worker_threads";
-import { WorkerSuccess, ZipEntryResult } from "../types";
+import { ZipEntryResult } from "../types";
+import { hasDatabaseConfig } from "../db";
+import { persistWebhookPayload } from "../models/filePayload";
 
 type WorkerPayload = {
   zipPath: string;
+  originalFileName: string;
 };
 
 function runUnzipCommand(args: string[], zipPath: string): Promise<string> {
@@ -106,7 +109,7 @@ async function readFileFromArchive(zipPath: string, archiveFilePath: string): Pr
 
 (async function run() {
   try {
-    const { zipPath } = workerData as WorkerPayload;
+    const { zipPath, originalFileName } = workerData as WorkerPayload;
 
     if (!zipPath || !fs.existsSync(zipPath)) {
       throw new Error("ZIP file not found.");
@@ -117,22 +120,40 @@ async function readFileFromArchive(zipPath: string, archiveFilePath: string): Pr
     const jsonText = await readFileFromArchive(zipPath, jsonFilePath);
     const jsonContents = JSON.parse(jsonText);
 
-    const result: WorkerSuccess = {
-      archivePath: zipPath,
-      extractedTo: path.join(path.dirname(zipPath), "[memory]"),
-      totalEntries: listedFiles.length,
-      entries: buildEntries(listedFiles),
-      extractedFiles: listedFiles,
-      jsonFilePath,
-      jsonContents
-    };
+    console.log("Large worker unzip summary:");
+    console.log(
+      JSON.stringify(
+        {
+          archivePath: zipPath,
+          extractedTo: path.join(path.dirname(zipPath), "[memory]"),
+          totalEntries: listedFiles.length,
+          entries: buildEntries(listedFiles),
+          extractedFiles: listedFiles,
+          jsonFilePath
+        },
+        null,
+        2
+      )
+    );
 
-    console.log("Large worker unzip result:");
-    console.log(JSON.stringify(result, null, 2));
+    if (hasDatabaseConfig()) {
+      await persistWebhookPayload(originalFileName, jsonContents);
+    } else {
+      console.log("Postgres connection not configured. Skipping database write.");
+    }
 
-    parentPort?.postMessage(result);
+    parentPort?.postMessage({ ok: true });
+    fs.rm(zipPath, { force: true }, (error) => {
+      if (error) {
+        const message = error instanceof Error ? error.message : "Unknown cleanup error";
+        console.warn(`Failed to remove uploaded archive ${zipPath}: ${message}`);
+      }
+      process.exit(0);
+    });
+    return;
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown worker error";
     parentPort?.postMessage({ error: message });
+    process.exit(1);
   }
 })();
