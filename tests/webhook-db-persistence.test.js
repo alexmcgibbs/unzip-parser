@@ -105,9 +105,11 @@ test("persists files, accounts, and holdings rows after webhook upload", async (
   const response = await request(app)
     .post("/webhook")
     .send({ fileUrl: sampleZipUrl })
-    .expect(202);
+    .expect(200);
 
   assert.equal(response.body.message, "ZIP received and queued for processing.");
+  assert.equal(typeof response.body.jobId, "string");
+  assert.ok(response.body.jobId.length > 0);
 
   await waitForCondition(async () => {
     const countResult = await pool.query(
@@ -130,7 +132,7 @@ test("persists files, accounts, and holdings rows after webhook upload", async (
   assert.equal(fileCountResult.rows[0].total, 1, "Expected one files row after upload");
 
   const filesResult = await pool.query(
-    `SELECT file_name, client_id, first_name, last_name, email, advisor_id
+    `SELECT file_name, job_id, client_id, first_name, last_name, email, advisor_id
      FROM files
      WHERE client_id = $1`,
     [expectedPayload.client_id]
@@ -139,6 +141,7 @@ test("persists files, accounts, and holdings rows after webhook upload", async (
   assert.equal(filesResult.rows.length, 1, "Expected one files row for the client_id");
   const fileRow = filesResult.rows[0];
   assert.equal(fileRow.file_name, "sample.json");
+  assert.equal(fileRow.job_id, response.body.jobId);
   assert.equal(fileRow.client_id, expectedPayload.client_id);
   assert.equal(fileRow.first_name, expectedPayload.first_name);
   assert.equal(fileRow.last_name, expectedPayload.last_name);

@@ -1,7 +1,11 @@
 import { getDbPool } from "../db";
 import { parseFilePayload, PersistenceSummary } from "../types";
 
-export async function persistWebhookPayload(fileName: string, payload: unknown): Promise<PersistenceSummary> {
+export async function persistWebhookPayload(
+  fileName: string,
+  payload: unknown,
+  jobId: string
+): Promise<PersistenceSummary> {
   const parsed = parseFilePayload(payload);
   const pool = getDbPool();
   const client = await pool.connect();
@@ -12,16 +16,18 @@ export async function persistWebhookPayload(fileName: string, payload: unknown):
     await client.query(
       `INSERT INTO files (
         file_name,
+        job_id,
         client_id,
         first_name,
         last_name,
         email,
         advisor_id,
         last_updated
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
       ON CONFLICT (client_id)
       DO UPDATE SET
         file_name = EXCLUDED.file_name,
+        job_id = EXCLUDED.job_id,
         first_name = EXCLUDED.first_name,
         last_name = EXCLUDED.last_name,
         email = EXCLUDED.email,
@@ -30,6 +36,7 @@ export async function persistWebhookPayload(fileName: string, payload: unknown):
         updated_at = NOW()`,
       [
         fileName,
+        jobId,
         parsed.client_id,
         parsed.first_name,
         parsed.last_name,

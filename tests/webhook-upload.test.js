@@ -20,10 +20,11 @@ test("queues sample.zip URL and returns success message", async () => {
   const response = await request(app)
     .post("/webhook")
     .send({ fileUrl: sampleZipUrl })
-    .expect(202);
+    .expect(200);
 
   assert.equal(response.body.message, "ZIP received and queued for processing.");
-  assert.deepEqual(Object.keys(response.body), ["message"]);
+  assert.equal(typeof response.body.jobId, "string");
+  assert.ok(response.body.jobId.length > 0);
 });
 
 test.after(async () => {

@@ -9,6 +9,7 @@ import { ZipEntryResult } from "../types";
 
 type WorkerPayload = {
   fileUrl: string;
+  jobId: string;
 };
 
 async function readEntryToBuffer(entry: unzipper.Entry): Promise<Buffer> {
@@ -41,10 +42,14 @@ function createZipSourceStream(fileUrl: string): NodeJS.ReadableStream {
 
 (async function run() {
   try {
-    const { fileUrl } = workerData as WorkerPayload;
+    const { fileUrl, jobId } = workerData as WorkerPayload;
 
     if (!fileUrl) {
       throw new Error("ZIP file URL is required.");
+    }
+
+    if (!jobId) {
+      throw new Error("jobId is required.");
     }
 
     const zipStream = createZipSourceStream(fileUrl).pipe(unzipper.Parse({ forceStream: true }));
@@ -73,7 +78,7 @@ function createZipSourceStream(fileUrl: string): NodeJS.ReadableStream {
         jsonFilePaths.push(zipEntry.name);
 
         if (hasDatabaseConfig()) {
-          persistPromises.push(persistWebhookPayload(zipEntry.name, jsonContents));
+          persistPromises.push(persistWebhookPayload(zipEntry.name, jsonContents, jobId));
         }
 
         continue;

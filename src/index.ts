@@ -2,6 +2,7 @@ import express, { Request, Response } from "express";
 import path from "node:path";
 import { Worker } from "node:worker_threads";
 import { hasDatabaseConfig, testDatabaseConnection } from "./db";
+import { createQueuedJob, updateJobStatus } from "./models/jobs";
 import { enqueueJob, registerWorker, stopBoss } from "./pgBoss";
 import { WorkerError } from "./types";
 
@@ -12,6 +13,7 @@ const port = Number(process.env.PORT) || 3000;
 const WEBHOOK_QUEUE_NAME = "webhook-zip-process";
 
 type WebhookJobData = {
+  jobId: string;
   fileUrl: string;
 };
 
@@ -44,12 +46,21 @@ function runWorker(workerFileName: string, data: unknown): Promise<void> {
   });
 }
 
-function unzipInUrlWorker(fileUrl: string): Promise<void> {
-  return runWorker("unzipperWorker.js", { fileUrl });
+function unzipInUrlWorker(fileUrl: string, jobId: string): Promise<void> {
+  return runWorker("unzipperWorker.js", { fileUrl, jobId });
 }
 
 async function processWebhookJob(data: WebhookJobData): Promise<void> {
-  await unzipInUrlWorker(data.fileUrl);
+  await updateJobStatus(data.jobId, "started", null);
+
+  try {
+    await unzipInUrlWorker(data.fileUrl, data.jobId);
+    await updateJobStatus(data.jobId, "complete", null);
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : "Unknown worker error";
+    await updateJobStatus(data.jobId, "error", errorMessage);
+    throw error;
+  }
 }
 
 async function startWebhookQueueWorker(): Promise<void> {
@@ -114,10 +125,19 @@ app.post("/webhook", async (req: Request, res: Response) => {
       return;
     }
 
-    await enqueueJob<WebhookJobData>(WEBHOOK_QUEUE_NAME, { fileUrl });
+    const jobId = await createQueuedJob(fileUrl);
 
-    res.status(202).json({
-      message: "ZIP received and queued for processing."
+    try {
+      await enqueueJob<WebhookJobData>(WEBHOOK_QUEUE_NAME, { fileUrl, jobId });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : "Unknown error";
+      await updateJobStatus(jobId, "error", errorMessage);
+      throw error;
+    }
+
+    res.status(200).json({
+      message: "ZIP received and queued for processing.",
+      jobId
     });
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : "Unknown error";

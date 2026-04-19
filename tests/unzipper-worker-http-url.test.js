@@ -39,7 +39,7 @@ function runUnzipperWorker(fileUrl) {
   return new Promise((resolve, reject) => {
     const workerPath = path.resolve(__dirname, "../dist/workers/unzipperWorker.js");
     const worker = new Worker(workerPath, {
-      workerData: { fileUrl }
+      workerData: { fileUrl, jobId: "test-job-id" }
     });
 
     worker.once("message", (data) => {
