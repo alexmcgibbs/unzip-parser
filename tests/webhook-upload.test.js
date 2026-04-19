@@ -3,7 +3,13 @@ const assert = require("node:assert/strict");
 const path = require("node:path");
 const request = require("supertest");
 
-const { app } = require("../dist/index.js");
+process.env.DB_HOST ||= "localhost";
+process.env.DB_PORT ||= "5432";
+process.env.DB_NAME ||= "webhook_service";
+process.env.DB_USER ||= "webhook_user";
+process.env.DB_PASSWORD ||= "webhook_password";
+
+const { app, stopWebhookQueueWorker } = require("../dist/index.js");
 
 test("uploads sample.zip and returns success message", async () => {
   const projectRoot = path.resolve(__dirname, "..");
@@ -12,8 +18,12 @@ test("uploads sample.zip and returns success message", async () => {
   const response = await request(app)
     .post("/webhook")
     .attach("file", sampleZipPath)
-    .expect(200);
+    .expect(202);
 
-    assert.equal(response.body.message, "ZIP received, processed, and persisted successfully.");
-    assert.deepEqual(Object.keys(response.body), ["message"]);
+  assert.equal(response.body.message, "ZIP received and queued for processing.");
+  assert.deepEqual(Object.keys(response.body), ["message"]);
+});
+
+test.after(async () => {
+  await stopWebhookQueueWorker();
 });
