@@ -16,6 +16,16 @@ export type ZipWorkerResult = {
   resolvedName: string;
 };
 
+type GotErrorLike = {
+  name?: string;
+  code?: string;
+  message?: string;
+  response?: {
+    statusCode?: number;
+    statusMessage?: string;
+  };
+};
+
 async function readEntryToBuffer(entry: unzipper.Entry): Promise<Buffer> {
   const chunks: Buffer[] = [];
 
@@ -26,8 +36,13 @@ async function readEntryToBuffer(entry: unzipper.Entry): Promise<Buffer> {
   return Buffer.concat(chunks);
 }
 
-function createZipSourceStream(fileUrl: string): NodeJS.ReadableStream {
-  const url = new URL(fileUrl);
+async function createZipSourceStream(fileUrl: string): Promise<NodeJS.ReadableStream> {
+  let url: URL;
+  try {
+    url = new URL(fileUrl);
+  } catch {
+    throw new Error(`Invalid fileUrl. Expected absolute URL, received: ${fileUrl}`);
+  }
 
   if (url.protocol === "file:") {
     const localPath = fileURLToPath(url);
@@ -38,10 +53,46 @@ function createZipSourceStream(fileUrl: string): NodeJS.ReadableStream {
   }
 
   if (url.protocol === "http:" || url.protocol === "https:") {
-    return got.stream(fileUrl);
+    return new Promise<NodeJS.ReadableStream>((resolve, reject) => {
+      const stream = got.stream(fileUrl, { throwHttpErrors: false });
+      stream.once("response", (response) => {
+        const { statusCode, statusMessage } = response;
+        if (statusCode < 200 || statusCode >= 300) {
+          stream.destroy();
+          reject(new Error(`Failed to download ZIP. HTTP ${statusCode} ${statusMessage ?? ""}. URL: ${fileUrl}`));
+        } else {
+          resolve(stream);
+        }
+      });
+      stream.once("error", (err) => {
+        reject(new Error(`Failed to download ZIP from URL: ${fileUrl}. ${err.message}`));
+      });
+    });
   }
 
   throw new Error(`Unsupported file URL protocol: ${url.protocol}`);
+}
+
+function normalizeZipSourceError(error: unknown, fileUrl: string): Error {
+  const err = error as GotErrorLike;
+  const message = err?.message ?? "Unknown error";
+
+  if (err?.name === "HTTPError") {
+    const statusCode = err.response?.statusCode ?? "unknown";
+    const statusMessage = err.response?.statusMessage ?? "HTTP error";
+    return new Error(`Failed to download ZIP. HTTP ${statusCode} ${statusMessage}. URL: ${fileUrl}`);
+  }
+
+  if (err?.name === "RequestError") {
+    const code = err.code ? ` (${err.code})` : "";
+    return new Error(`Failed to download ZIP from URL${code}: ${fileUrl}. ${message}`);
+  }
+
+  if (message.toLowerCase().includes("invalid") && message.toLowerCase().includes("zip")) {
+    return new Error(`Downloaded content is not a valid ZIP archive. URL: ${fileUrl}`);
+  }
+
+  return error instanceof Error ? error : new Error(String(error));
 }
 
 const MAX_UNZIPPED_DEFAULT_BYTES = 100 * 1024 * 1024; // 100 MB
@@ -67,68 +118,73 @@ export async function processZipJob({ fileUrl, jobId }: ZipWorkerPayload): Promi
 
   const maxUnzippedBytes = parseMaxUnzippedBytes();
 
-  const zipStream = createZipSourceStream(fileUrl).pipe(unzipper.Parse({ forceStream: true }));
-  const entries: ZipEntryResult[] = [];
-  const extractedFiles: string[] = [];
-  const jsonFilePaths: string[] = [];
+  try {
+    const sourceStream = await createZipSourceStream(fileUrl);
+    const zipStream = sourceStream.pipe(unzipper.Parse({ forceStream: true }));
+    const entries: ZipEntryResult[] = [];
+    const extractedFiles: string[] = [];
+    const jsonFilePaths: string[] = [];
 
-  for await (const entry of zipStream) {
-    const zipEntry: ZipEntryResult = {
-      name: entry.path,
-      size: Number(entry.vars.uncompressedSize ?? 0),
-      compressedSize: Number(entry.vars.compressedSize ?? 0),
-      isDirectory: entry.type === "Directory"
-    };
+    for await (const entry of zipStream) {
+      const zipEntry: ZipEntryResult = {
+        name: entry.path,
+        size: Number(entry.vars.uncompressedSize ?? 0),
+        compressedSize: Number(entry.vars.compressedSize ?? 0),
+        isDirectory: entry.type === "Directory"
+      };
 
-    entries.push(zipEntry);
+      entries.push(zipEntry);
 
-    if (!zipEntry.isDirectory) {
-      extractedFiles.push(zipEntry.name);
-    }
-
-    if (!zipEntry.isDirectory && zipEntry.name.toLowerCase().endsWith(".json")) {
-      const uncompressedSize = Number(entry.vars.uncompressedSize ?? 0);
-      if (uncompressedSize > maxUnzippedBytes) {
-        throw new Error(
-          `Entry "${zipEntry.name}" uncompressed size ${uncompressedSize} bytes exceeds MAX_UNZIPPED limit of ${maxUnzippedBytes} bytes.`
-        );
+      if (!zipEntry.isDirectory) {
+        extractedFiles.push(zipEntry.name);
       }
 
-      const jsonBuffer = await readEntryToBuffer(entry);
-      const jsonContents = JSON.parse(jsonBuffer.toString("utf8"));
-      jsonFilePaths.push(zipEntry.name);
+      if (!zipEntry.isDirectory && zipEntry.name.toLowerCase().endsWith(".json")) {
+        const uncompressedSize = Number(entry.vars.uncompressedSize ?? 0);
+        if (uncompressedSize > maxUnzippedBytes) {
+          throw new Error(
+            `Entry "${zipEntry.name}" uncompressed size ${uncompressedSize} bytes exceeds MAX_UNZIPPED limit of ${maxUnzippedBytes} bytes.`
+          );
+        }
 
-      if (hasDatabaseConfig()) {
-        await persistWebhookPayload(zipEntry.name, jsonContents, jobId);
+        const jsonBuffer = await readEntryToBuffer(entry);
+        const jsonContents = JSON.parse(jsonBuffer.toString("utf8"));
+        jsonFilePaths.push(zipEntry.name);
+
+        if (hasDatabaseConfig()) {
+          await persistWebhookPayload(zipEntry.name, jsonContents, jobId);
+        }
+
+        continue;
       }
 
-      continue;
+      entry.autodrain();
     }
 
-    entry.autodrain();
+    if (jsonFilePaths.length === 0) {
+      throw new Error("No JSON file found in ZIP contents.");
+    }
+
+    console.log("Unzipper worker unzip summary:");
+    console.log(
+      JSON.stringify(
+        {
+          archivePath: fileUrl,
+          totalEntries: entries.length,
+          extractedFiles,
+          jsonFilePaths
+        },
+        null,
+        2
+      )
+    );
+
+    if (!hasDatabaseConfig()) {
+      console.log("Postgres connection not configured. Skipping database write.");
+    }
+
+    return { ok: true, resolvedName: jsonFilePaths[0] };
+  } catch (error) {
+    throw normalizeZipSourceError(error, fileUrl);
   }
-
-  if (jsonFilePaths.length === 0) {
-    throw new Error("No JSON file found in ZIP contents.");
-  }
-
-  console.log("Unzipper worker unzip summary:");
-  console.log(
-    JSON.stringify(
-      {
-        archivePath: fileUrl,
-        totalEntries: entries.length,
-        extractedFiles,
-        jsonFilePaths
-      },
-      null,
-      2
-    )
-  );
-
-  if (!hasDatabaseConfig()) {
-    console.log("Postgres connection not configured. Skipping database write.");
-  }
-
-  return { ok: true, resolvedName: jsonFilePaths[0] };
 }

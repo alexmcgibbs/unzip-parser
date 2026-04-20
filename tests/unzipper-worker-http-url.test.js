@@ -5,6 +5,17 @@ const path = require("node:path");
 const http = require("node:http");
 const { FixedThreadPool } = require("poolifier");
 
+const workerPath = path.resolve(__dirname, "../dist/workers/unzipperPoolWorker.js");
+let pool;
+
+test.before(() => {
+  pool = new FixedThreadPool(1, workerPath);
+});
+
+test.after(async () => {
+  await pool.destroy();
+});
+
 function startZipServer(zipPath) {
   return new Promise((resolve, reject) => {
     const server = http.createServer((req, res) => {
@@ -35,25 +46,12 @@ function startZipServer(zipPath) {
   });
 }
 
-async function runUnzipperPoolWorker(fileUrl) {
-  const workerPath = path.resolve(__dirname, "../dist/workers/unzipperPoolWorker.js");
-  const workerConcurrency = 1;
-  console.log(`[test] Creating unzipper worker pool with concurrency=${workerConcurrency}`);
-  const pool = new FixedThreadPool(workerConcurrency, workerPath);
-
-  try {
-    return await pool.execute({ fileUrl, jobId: "test-job-id" });
-  } finally {
-    await pool.destroy();
-  }
-}
-
 async function withZipServer(fn) {
   const projectRoot = path.resolve(__dirname, "..");
   const sampleZipPath = path.join(projectRoot, "sample.zip");
   const started = await startZipServer(sampleZipPath);
   try {
-    await fn(started.fileUrl);
+    await fn(started.fileUrl, started.server);
   } finally {
     await new Promise((resolve, reject) => {
       started.server.close((err) => (err ? reject(err) : resolve()));
@@ -63,29 +61,35 @@ async function withZipServer(fn) {
 
 test("unzipperPoolWorker streams ZIP from http URL", async () => {
   await withZipServer(async (fileUrl) => {
-    const result = await runUnzipperPoolWorker(fileUrl);
-
+    const result = await pool.execute({ fileUrl, jobId: "test-job-id" });
     assert.equal(result.ok, true);
     assert.equal(result.resolvedName, "sample.json");
   });
 });
 
-test("unzipperPoolWorker resolves name from ZIP entries when filename is omitted", async () => {
+test("unzipperPoolWorker resolves name from ZIP entries", async () => {
   await withZipServer(async (fileUrl) => {
-    // Worker derives name from extracted ZIP entry path
-    const result = await runUnzipperPoolWorker(fileUrl);
-
+    const result = await pool.execute({ fileUrl, jobId: "test-job-id-2" });
     assert.equal(result.ok, true);
-
-    // Must be derived from an entry path inside the ZIP, not any repo filesystem path
-    assert.ok(
-      typeof result.resolvedName === "string" && result.resolvedName.length > 0,
-      "resolvedName should be a non-empty string"
-    );
-    assert.ok(
-      !path.isAbsolute(result.resolvedName),
-      `resolvedName should not be an absolute filesystem path, got: ${result.resolvedName}`
-    );
+    assert.ok(typeof result.resolvedName === "string" && result.resolvedName.length > 0);
+    assert.ok(!path.isAbsolute(result.resolvedName));
     assert.equal(result.resolvedName, "sample.json");
   });
+});
+
+test("unzipperPoolWorker throws clear error on 404 URL", async () => {
+  await withZipServer(async (fileUrl) => {
+    const missingUrl = fileUrl.replace("/sample.zip", "/missing.zip");
+    await assert.rejects(
+      pool.execute({ fileUrl: missingUrl, jobId: "test-404" }),
+      /Failed to download ZIP\. HTTP 404/i
+    );
+  });
+});
+
+test("unzipperPoolWorker throws clear error on invalid URL", async () => {
+  await assert.rejects(
+    pool.execute({ fileUrl: "not-a-valid-url", jobId: "test-invalid" }),
+    /Invalid fileUrl\. Expected absolute URL/i
+  );
 });

@@ -140,7 +140,7 @@ curl -X POST http://localhost:3000/webhook \
 Check job status (replace `<jobId>` with the ID returned above):
 
 ```bash
-curl http://localhost:3000/job/a54043db-eca1-4810-ac70-4125d21b5e9e
+curl http://localhost:3000/job/cf4be850-f1a9-481d-831f-b90a3ee6c5ff
 ```
 
 

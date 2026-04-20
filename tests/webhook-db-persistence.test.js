@@ -2,7 +2,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
-const { pathToFileURL } = require("node:url");
+const http = require("node:http");
 const request = require("supertest");
 const { Pool } = require("pg");
 
@@ -59,6 +59,36 @@ async function clearPendingWebhookQueueJobs() {
   }
 }
 
+function startZipServer(zipPath) {
+  return new Promise((resolve, reject) => {
+    const server = http.createServer((req, res) => {
+      if (req.url !== "/sample.zip") {
+        res.statusCode = 404;
+        res.end("Not found");
+        return;
+      }
+
+      res.setHeader("content-type", "application/zip");
+      fs.createReadStream(zipPath).pipe(res);
+    });
+
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        server.close();
+        reject(new Error("Failed to resolve test HTTP server address."));
+        return;
+      }
+
+      resolve({
+        server,
+        fileUrl: `http://127.0.0.1:${address.port}/sample.zip`
+      });
+    });
+  });
+}
+
 async function waitForCondition(check, timeoutMs = 45000, intervalMs = 500) {
   const start = Date.now();
   let lastError = null;
@@ -105,13 +135,20 @@ test("persists files, accounts, and holdings rows after webhook upload", async (
 
   const projectRoot = path.resolve(__dirname, "..");
   const sampleZipPath = path.join(projectRoot, "sample.zip");
-  const sampleZipUrl = pathToFileURL(sampleZipPath).toString();
   const sampleJsonPath = path.join(projectRoot, "sample.json");
   const expectedPayload = JSON.parse(fs.readFileSync(sampleJsonPath, "utf8"));
   const expectedHoldingsCount = expectedPayload.accounts.reduce(
     (sum, account) => sum + account.holdings.length,
     0
   );
+
+  const started = await startZipServer(sampleZipPath);
+  const sampleZipUrl = started.fileUrl;
+  t.after(async () => {
+    await new Promise((resolve, reject) => {
+      started.server.close((err) => (err ? reject(err) : resolve()));
+    });
+  });
 
   await clearPendingWebhookQueueJobs();
   await pool.query("DELETE FROM files WHERE client_id = $1", [expectedPayload.client_id]);
