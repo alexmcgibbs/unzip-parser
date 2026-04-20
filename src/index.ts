@@ -1,5 +1,6 @@
 import express, { Request, Response } from "express";
 import path from "node:path";
+import fs from "node:fs";
 import { hasDatabaseConfig, testDatabaseConnection } from "./db";
 import { createQueuedJob, getJobDetails, updateJobStatus, updateJobPgbossId } from "./models/jobs";
 import { enqueueJob } from "./pgBoss";
@@ -9,6 +10,7 @@ const app = express();
 app.use(express.json());
 
 const port = Number(process.env.PORT) || 3000;
+const NODE_ENV = process.env.NODE_ENV ?? "development";
 
 app.get("/", (_req: Request, res: Response) => {
   res.json({
@@ -50,6 +52,33 @@ app.get("/job/:id", async (req: Request, res: Response) => {
     });
   }
 });
+
+if (NODE_ENV !== "production") {
+  app.get("/test", (_req: Request, res: Response) => {
+    const uploadsTestDir = path.resolve(process.cwd(), "uploads", "test");
+    let files: string[];
+    try {
+      files = fs.readdirSync(uploadsTestDir)
+        .filter((f) => fs.statSync(path.join(uploadsTestDir, f)).isFile())
+        .sort((a, b) => a.localeCompare(b));
+    } catch {
+      res.status(404).json({ error: "uploads/test directory not found." });
+      return;
+    }
+
+    if (files.length === 0) {
+      res.status(404).json({ error: "No files found in uploads/test directory." });
+      return;
+    }
+
+    const filePath = path.join(uploadsTestDir, files[0]);
+    res.download(filePath, files[0], (err) => {
+      if (err && !res.headersSent) {
+        res.status(404).json({ error: "File not found." });
+      }
+    });
+  });
+}
 
 app.post("/webhook", async (req: Request, res: Response) => {
   try {

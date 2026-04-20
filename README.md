@@ -1,19 +1,23 @@
 # Webhook ZIP Worker Service
 
-Express + TypeScript service that accepts a ZIP upload on a webhook endpoint, then unzips and analyzes it in a worker thread.
-
-The project also includes Docker support for running the API alongside a separate Postgres container.
+Express + TypeScript service that accepts a ZIP file URL on a webhook endpoint, downloads and processes it asynchronously in a Poolifier worker thread pool, and persists results to Postgres.
 
 ## What it does
 
-- Exposes `POST /webhook`
-- Accepts `multipart/form-data` with a file field named `file`
-- Saves uploaded ZIP into `uploads/`
-- Uses a worker thread to:
-  - unzip archive contents
-  - list ZIP entries and extracted files
-  - print results to stdout
-- Returns processing result JSON in HTTP response
+- Accepts `POST /webhook` with a JSON body containing a `fileUrl`
+- Creates a job record in Postgres and enqueues it via pg-boss
+- A pool of worker threads downloads the ZIP from the URL, streams and extracts entries, parses JSON payloads, and persists accounts/holdings to Postgres
+- Failed jobs are retried up to 3 times (network and transient errors only)
+- Job status is queryable at any time via `GET /job/:id`
+
+## Architecture
+
+- **Express** — HTTP layer (routes only in `src/index.ts`)
+- **pg-boss** — durable job queue backed by Postgres; workers aligned to thread pool size
+- **Poolifier `FixedThreadPool`** — parallel ZIP processing; pool size defaults to `min(availableParallelism(), 4)`, overridable via `WORKER_CONCURRENCY`
+- **got** — streams the ZIP file from the remote URL inside each worker thread
+- **unzipper** — parses the ZIP stream entry-by-entry without buffering the full archive to disk
+- **Postgres** — job tracking (`jobs`, `files`, `accounts`, `holdings` tables); migrations in `db/migrations/`
 
 ## Setup
 
@@ -25,11 +29,19 @@ npm start
 
 Server starts on port `3000` by default.
 
-Additional environment variables:
+Copy `.env.example` to `.env` for local Postgres configuration.
 
-- `FILE_LIMIT`: max accepted upload size for Multer. Defaults to `2gb`.
-- `LARGE_FILE_LIMIT`: threshold for switching from the regular unzip worker to the child-process-based large worker. Defaults to `50mb`.
-  If the `unzip` binary is unavailable, the app falls back to the regular worker.
+### Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `PORT` | `3000` | HTTP port |
+| `WORKER_CONCURRENCY` | `min(availableParallelism(), 4)` | Worker thread pool size |
+| `DB_HOST` | — | Postgres host |
+| `DB_PORT` | `5432` | Postgres port |
+| `DB_NAME` | — | Postgres database name |
+| `DB_USER` | — | Postgres user |
+| `DB_PASSWORD` | — | Postgres password |
 
 ## Docker Setup
 
@@ -44,26 +56,50 @@ Services:
 - API: `http://localhost:3000`
 - Postgres: `localhost:5432`
 
-The API image installs the `unzip` binary so large-file processing works inside Docker.
-
 On first Postgres container creation (empty data volume), the container automatically runs all `db/migrations/*.up.sql` files.
 
-If you need to re-run initialization migrations from scratch, remove the Postgres volume and recreate containers:
+To reset the database and start fresh:
 
 ```bash
 docker compose down -v
 docker compose up --build
 ```
 
-The app container receives these database environment variables:
+## Endpoints
 
-- `DB_HOST`
-- `DB_PORT`
-- `DB_NAME`
-- `DB_USER`
-- `DB_PASSWORD`
+### `POST /webhook`
 
-You can copy `.env.example` for local non-Docker development if you want the service to connect to a local Postgres instance.
+Enqueue a ZIP file for processing.
+
+**Request:**
+```json
+{ "fileUrl": "https://example.com/data.zip" }
+```
+
+**Response:**
+```json
+{
+  "message": "ZIP received and queued for processing.",
+  "jobId": "550e8400-e29b-41d4-a716-446655440000"
+}
+```
+
+### `GET /job/:id`
+
+Poll job status.
+
+**Response:**
+```json
+{
+  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "complete",
+  "url": "https://example.com/data.zip",
+  "retries": 0,
+  "error": null
+}
+```
+
+Possible `status` values: `queued`, `started`, `complete`, `error`.
 
 ## Testing
 
@@ -73,15 +109,11 @@ Run all tests (build + test runner):
 npm test
 ```
 
-Run only the webhook response test:
+Run individual test files:
 
 ```bash
 node --test tests/webhook-upload.test.js
-```
-
-Run only the DB persistence test:
-
-```bash
+node --test tests/unzipper-worker-http-url.test.js
 node --test tests/webhook-db-persistence.test.js
 ```
 
@@ -97,31 +129,18 @@ npm test
 
 ## Test with curl
 
+Enqueue a ZIP for processing:
+
 ```bash
 curl -X POST http://localhost:3000/webhook \
-  -F "file=@/mnt/c/Users/Alex/GitHub/fartherTS/sample.zip"
+  -H "Content-Type: application/json" \
+  -d '{"fileUrl": "http://localhost:3000/test"}'
 ```
 
-## Response example
+Check job status (replace `<jobId>` with the ID returned above):
 
-```json
-{
-  "message": "ZIP received and processed successfully.",
-  "result": {
-    "archivePath": "...",
-    "extractedTo": "...",
-    "totalEntries": 3,
-    "entries": [
-      {
-        "name": "docs/readme.txt",
-        "size": 120,
-        "compressedSize": 84,
-        "isDirectory": false
-      }
-    ],
-    "extractedFiles": [
-      "docs/readme.txt"
-    ]
-  }
-}
+```bash
+curl http://localhost:3000/job/a54043db-eca1-4810-ac70-4125d21b5e9e
 ```
+
+
