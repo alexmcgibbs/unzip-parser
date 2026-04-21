@@ -6,7 +6,7 @@ import { registerWorker, stopBoss } from "./pgBoss";
 import { ZipWorkerPayload, ZipWorkerResult } from "./workers/processZipJob";
 
 const DEFAULT_WORKER_CONCURRENCY = Math.max(1, Math.min(availableParallelism(), 4));
-export const WEBHOOK_QUEUE_NAME = "webhook-zip-process";
+export const WEBHOOK_QUEUE_NAME = process.env.WEBHOOK_QUEUE_NAME ?? "webhook-zip-process";
 
 export type WebhookJobData = {
   jobId: string;
@@ -32,12 +32,27 @@ export function getWorkerConcurrency(): number {
 }
 
 export function isRetryableError(error: unknown): boolean {
-  if (!(error instanceof Error)) {
+  if (error == null || (typeof error !== "object" && typeof error !== "string")) {
     return false;
   }
 
-  const message = error.message.toLowerCase();
-  const code = (error as NodeJS.ErrnoException).code;
+  const errorLike = error as { message?: unknown; code?: unknown; errno?: unknown };
+  const message =
+    typeof errorLike.message === "string"
+      ? errorLike.message.toLowerCase()
+      : typeof error === "string"
+        ? error.toLowerCase()
+        : "";
+  const code =
+    typeof errorLike.code === "string"
+      ? errorLike.code.toUpperCase()
+      : typeof errorLike.errno === "string"
+        ? errorLike.errno.toUpperCase()
+        : "";
+
+  if (!message && !code) {
+    return false;
+  }
 
   // Network-related errors
   const networkErrors = [
@@ -49,12 +64,19 @@ export function isRetryableError(error: unknown): boolean {
     "ENETUNREACH",
     "EPIPE"
   ];
-  if (networkErrors.includes(code ?? "")) {
+  if (networkErrors.includes(code)) {
     return true;
   }
 
   // Message-based detection for connection/timeout issues
   const retryablePatterns = [
+    "econnrefused",
+    "econnreset",
+    "enotfound",
+    "etimedout",
+    "ehostunreach",
+    "enetunreach",
+    "epipe",
     "connection",
     "timeout",
     "temporarily unavailable",

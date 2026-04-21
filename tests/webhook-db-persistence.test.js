@@ -2,7 +2,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
-const http = require("node:http");
+const { pathToFileURL } = require("node:url");
 const request = require("supertest");
 const { Pool } = require("pg");
 
@@ -12,9 +12,23 @@ process.env.DB_NAME ||= "webhook_service";
 process.env.DB_USER ||= "webhook_user";
 process.env.DB_PASSWORD ||= "webhook_password";
 process.env.WORKER_CONCURRENCY ||= "2";
+process.env.WEBHOOK_QUEUE_NAME ||= `webhook-zip-process-dbtest-${process.pid}`;
 
 const { app, startWebhookQueueWorker, stopWebhookQueueWorker } = require("../dist/index.js");
-const WEBHOOK_QUEUE_NAME = "webhook-zip-process";
+const WEBHOOK_QUEUE_NAME = process.env.WEBHOOK_QUEUE_NAME;
+
+function toRegularFileUrl(filePath) {
+  const normalizedPath = filePath.replace(/\\/g, "/");
+  const wslMountMatch = normalizedPath.match(/^\/mnt\/([a-z])\/(.+)$/i);
+
+  if (wslMountMatch) {
+    const drive = wslMountMatch[1].toUpperCase();
+    const rest = wslMountMatch[2];
+    return `file:///${drive}:/${rest}`;
+  }
+
+  return pathToFileURL(filePath).href;
+}
 
 const pool = new Pool({
   host: process.env.DB_HOST,
@@ -57,36 +71,6 @@ async function clearPendingWebhookQueueJobs() {
   } catch {
     // Skip cleanup when pgboss schema is unavailable in the current environment.
   }
-}
-
-function startZipServer(zipPath) {
-  return new Promise((resolve, reject) => {
-    const server = http.createServer((req, res) => {
-      if (req.url !== "/sample.zip") {
-        res.statusCode = 404;
-        res.end("Not found");
-        return;
-      }
-
-      res.setHeader("content-type", "application/zip");
-      fs.createReadStream(zipPath).pipe(res);
-    });
-
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      if (!address || typeof address === "string") {
-        server.close();
-        reject(new Error("Failed to resolve test HTTP server address."));
-        return;
-      }
-
-      resolve({
-        server,
-        fileUrl: `http://127.0.0.1:${address.port}/sample.zip`
-      });
-    });
-  });
 }
 
 async function waitForCondition(check, timeoutMs = 45000, intervalMs = 500) {
@@ -134,25 +118,22 @@ test("persists files, accounts, and holdings rows after webhook upload", async (
   }
 
   const projectRoot = path.resolve(__dirname, "..");
-  const sampleZipPath = path.join(projectRoot, "sample.zip");
   const sampleJsonPath = path.join(projectRoot, "sample.json");
+  const sampleZipPath = path.join(projectRoot, "sample.zip");
   const expectedPayload = JSON.parse(fs.readFileSync(sampleJsonPath, "utf8"));
   const expectedHoldingsCount = expectedPayload.accounts.reduce(
     (sum, account) => sum + account.holdings.length,
     0
   );
 
-  const started = await startZipServer(sampleZipPath);
-  const sampleZipUrl = started.fileUrl;
-  t.after(async () => {
-    await new Promise((resolve, reject) => {
-      started.server.close((err) => (err ? reject(err) : resolve()));
-    });
-  });
+  if (!fs.existsSync(sampleZipPath)) {
+    t.skip(`sample.zip not found at ${sampleZipPath}; skipping DB persistence test.`);
+    return;
+  }
+
+  const sampleZipUrl = toRegularFileUrl(sampleZipPath);
 
   await clearPendingWebhookQueueJobs();
-  await pool.query("DELETE FROM files WHERE client_id = $1", [expectedPayload.client_id]);
-  await pool.query("DELETE FROM jobs WHERE url = $1", [sampleZipUrl]);
 
   await startWebhookQueueWorker();
 
@@ -190,8 +171,9 @@ test("persists files, accounts, and holdings rows after webhook upload", async (
     const countResult = await pool.query(
       `SELECT COUNT(*)::int AS total
        FROM files
-       WHERE client_id = $1`,
-      [expectedPayload.client_id]
+       WHERE client_id = $1
+         AND job_id = $2`,
+      [expectedPayload.client_id, response.body.jobId]
     );
 
     return countResult.rows[0].total === 1;
@@ -200,20 +182,22 @@ test("persists files, accounts, and holdings rows after webhook upload", async (
   const fileCountResult = await pool.query(
     `SELECT COUNT(*)::int AS total
      FROM files
-     WHERE client_id = $1`,
-    [expectedPayload.client_id]
+     WHERE client_id = $1
+       AND job_id = $2`,
+    [expectedPayload.client_id, response.body.jobId]
   );
 
-  assert.equal(fileCountResult.rows[0].total, 1, "Expected one files row after upload");
+  assert.equal(fileCountResult.rows[0].total, 1, "Expected one files row for matching client_id/job_id");
 
   const filesResult = await pool.query(
     `SELECT file_name, job_id, client_id, first_name, last_name, email, advisor_id
      FROM files
-     WHERE client_id = $1`,
-    [expectedPayload.client_id]
+     WHERE client_id = $1
+       AND job_id = $2`,
+    [expectedPayload.client_id, response.body.jobId]
   );
 
-  assert.equal(filesResult.rows.length, 1, "Expected one files row for the client_id");
+  assert.equal(filesResult.rows.length, 1, "Expected one files row for the client_id/job_id pair");
   const fileRow = filesResult.rows[0];
   assert.equal(fileRow.file_name, "sample.json");
   assert.equal(fileRow.job_id, response.body.jobId);
@@ -277,8 +261,11 @@ test("persists files, accounts, and holdings rows after webhook upload", async (
   );
   assert.equal(lookedUpHoldingsCount, expectedHoldingsCount);
 
+  await pool.query("DELETE FROM files WHERE job_id = $1 AND client_id = $2", [
+    response.body.jobId,
+    expectedPayload.client_id
+  ]);
   await pool.query("DELETE FROM jobs WHERE job_id = $1", [response.body.jobId]);
-  await pool.query("DELETE FROM files WHERE client_id = $1", [expectedPayload.client_id]);
 });
 
 test.after(async () => {

@@ -54,25 +54,68 @@ app.get("/job/:id", async (req: Request, res: Response) => {
 });
 
 if (NODE_ENV !== "production") {
-  app.get("/test", (_req: Request, res: Response) => {
+  app.get("/test", (req: Request, res: Response) => {
     const uploadsTestDir = path.resolve(process.cwd(), "uploads", "test");
-    let files: string[];
-    try {
-      files = fs.readdirSync(uploadsTestDir)
-        .filter((f) => fs.statSync(path.join(uploadsTestDir, f)).isFile())
-        .sort((a, b) => a.localeCompare(b));
-    } catch {
-      res.status(404).json({ error: "uploads/test directory not found." });
+    const uploadsDir = path.resolve(process.cwd(), "uploads");
+    const sourceDirs = [uploadsTestDir, uploadsDir];
+
+    const filesByDir = new Map<string, string[]>();
+    for (const dir of sourceDirs) {
+      try {
+        const files = fs.readdirSync(dir)
+          .filter((f) => fs.statSync(path.join(dir, f)).isFile())
+          .sort((a, b) => a.localeCompare(b));
+        filesByDir.set(dir, files);
+      } catch {
+        filesByDir.set(dir, []);
+      }
+    }
+
+    const hasAnyFiles = sourceDirs.some((dir) => (filesByDir.get(dir) ?? []).length > 0);
+    if (!hasAnyFiles) {
+      res.status(404).json({ error: "No files found in uploads/test or uploads directory." });
       return;
     }
 
-    if (files.length === 0) {
-      res.status(404).json({ error: "No files found in uploads/test directory." });
+    const requestedFile = typeof req.query.file === "string" ? req.query.file : "";
+    const normalizedRequested = path.posix.basename(requestedFile.trim());
+
+    if (requestedFile && normalizedRequested !== requestedFile.trim()) {
+      res.status(400).json({ error: "Invalid file query parameter." });
       return;
     }
 
-    const filePath = path.join(uploadsTestDir, files[0]);
-    res.download(filePath, files[0], (err) => {
+    let selectedFile = "";
+    let selectedDir = "";
+
+    if (normalizedRequested) {
+      for (const dir of sourceDirs) {
+        const files = filesByDir.get(dir) ?? [];
+        const exactMatch = files.find((file) => file === normalizedRequested);
+        if (exactMatch) {
+          selectedFile = exactMatch;
+          selectedDir = dir;
+          break;
+        }
+      }
+
+      if (!selectedFile) {
+        res.status(404).json({ error: `File not found in uploads/test: ${normalizedRequested}` });
+        return;
+      }
+    } else {
+      for (const dir of sourceDirs) {
+        const files = filesByDir.get(dir) ?? [];
+        if (files.length > 0) {
+          selectedFile = files[0];
+          selectedDir = dir;
+          break;
+        }
+      }
+    }
+
+    const filePath = path.join(selectedDir, selectedFile);
+    res.download(filePath, selectedFile, (err) => {
       if (err && !res.headersSent) {
         res.status(404).json({ error: "File not found." });
       }

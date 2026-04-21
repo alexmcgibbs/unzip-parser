@@ -19,6 +19,7 @@ export type ZipWorkerResult = {
 type GotErrorLike = {
   name?: string;
   code?: string;
+  errno?: string;
   message?: string;
   response?: {
     statusCode?: number;
@@ -36,6 +37,26 @@ async function readEntryToBuffer(entry: unzipper.Entry): Promise<Buffer> {
   return Buffer.concat(chunks);
 }
 
+function resolveLocalPathFromFileUrl(url: URL): string {
+  const localPath = fileURLToPath(url);
+  if (fs.existsSync(localPath)) {
+    return localPath;
+  }
+
+  // Support Windows-style file URLs when running on WSL/Linux (e.g., file:///C:/repo/file.zip).
+  const windowsPathMatch = url.pathname.match(/^\/([A-Za-z]):\/(.+)$/);
+  if (windowsPathMatch) {
+    const drive = windowsPathMatch[1].toLowerCase();
+    const rest = decodeURIComponent(windowsPathMatch[2]);
+    const wslPath = `/mnt/${drive}/${rest}`;
+    if (fs.existsSync(wslPath)) {
+      return wslPath;
+    }
+  }
+
+  return localPath;
+}
+
 async function createZipSourceStream(fileUrl: string): Promise<NodeJS.ReadableStream> {
   let url: URL;
   try {
@@ -45,7 +66,7 @@ async function createZipSourceStream(fileUrl: string): Promise<NodeJS.ReadableSt
   }
 
   if (url.protocol === "file:") {
-    const localPath = fileURLToPath(url);
+    const localPath = resolveLocalPathFromFileUrl(url);
     if (!fs.existsSync(localPath)) {
       throw new Error("ZIP file not found.");
     }
@@ -65,7 +86,11 @@ async function createZipSourceStream(fileUrl: string): Promise<NodeJS.ReadableSt
         }
       });
       stream.once("error", (err) => {
-        reject(new Error(`Failed to download ZIP from URL: ${fileUrl}. ${err.message}`));
+        const source = err as GotErrorLike;
+        const code = source?.code ?? source?.errno;
+        const codePart = code ? ` (${code})` : "";
+        const messagePart = source?.message ? ` ${source.message}` : "";
+        reject(new Error(`Failed to download ZIP from URL${codePart}: ${fileUrl}.${messagePart}`));
       });
     });
   }

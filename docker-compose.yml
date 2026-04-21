@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: fartherts-app
+    container_name: unzip-parser-app
     depends_on:
       postgres:
         condition: service_healthy
@@ -21,7 +21,7 @@ services:
 
   postgres:
     image: postgres:16-alpine
-    container_name: fartherts-postgres
+    container_name: unzip-parser-postgres
     environment:
       POSTGRES_DB: webhook_service
       POSTGRES_USER: webhook_user

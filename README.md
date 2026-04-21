@@ -101,6 +101,38 @@ Poll job status.
 
 Possible `status` values: `queued`, `started`, `complete`, `error`.
 
+### `GET /test` (non-production only)
+
+Serves ZIP files from local upload folders to make webhook testing easy.
+
+- File lookup order: `uploads/test` first, then `uploads`
+- Default behavior: returns the first file found in lookup order (sorted by filename)
+- Select a specific file: `GET /test?file=<filename.zip>` (looked up in `uploads/test`, then `uploads`)
+- Available only when `NODE_ENV !== production`
+
+Examples:
+
+```bash
+# Serve first file in uploads/test
+curl -OJ http://localhost:3000/test
+
+# Serve a specific ZIP file
+curl -OJ "http://localhost:3000/test?file=sample.zip"
+```
+
+To test uploading arbitrary ZIP files:
+
+1. Put a ZIP file under `uploads/test` or `uploads` (for example `uploads/test/custom.zip`).
+2. Enqueue it through `/webhook` using the test route URL.
+
+```bash
+curl -X POST http://localhost:3000/webhook \
+  -H "Content-Type: application/json" \
+  -d '{"fileUrl": "http://localhost:3000/test?file=sample.zip"}'
+```
+
+3. Poll the job status with the returned `jobId`.
+
 ## Testing
 
 Run all tests (build + test runner):
@@ -134,13 +166,13 @@ Enqueue a ZIP for processing:
 ```bash
 curl -X POST http://localhost:3000/webhook \
   -H "Content-Type: application/json" \
-  -d '{"fileUrl": "http://localhost:3000/test"}'
+  -d '{"fileUrl": "http://localhost:3000/test?file=large_test_5.zip"}'
 ```
 
 Check job status (replace `<jobId>` with the ID returned above):
 
 ```bash
-curl http://localhost:3000/job/cf4be850-f1a9-481d-831f-b90a3ee6c5ff
+curl http://localhost:3000/job/af4186c2-5487-4a28-8029-07736eddb720
 ```
 
 
