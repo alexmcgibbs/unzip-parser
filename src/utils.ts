@@ -96,14 +96,6 @@ export function createUnzipWorkerPool(
   return new FixedThreadPool<ZipWorkerPayload, ZipWorkerResult>(workerConcurrency, workerPath);
 }
 
-export async function executeZipInWorker(
-  pool: FixedThreadPool<ZipWorkerPayload, ZipWorkerResult>,
-  fileUrl: string,
-  jobId: string
-): Promise<void> {
-  await pool.execute({ fileUrl, jobId });
-}
-
 function getUnzipWorkerPool(workerConcurrency: number): FixedThreadPool<ZipWorkerPayload, ZipWorkerResult> {
   if (unzipWorkerPool) {
     return unzipWorkerPool;
@@ -114,15 +106,6 @@ function getUnzipWorkerPool(workerConcurrency: number): FixedThreadPool<ZipWorke
   return unzipWorkerPool;
 }
 
-async function unzipInUrlWorker(
-  workerConcurrency: number,
-  fileUrl: string,
-  jobId: string
-): Promise<void> {
-  const pool = getUnzipWorkerPool(workerConcurrency);
-  await executeZipInWorker(pool, fileUrl, jobId);
-}
-
 async function processWebhookJob(
   workerConcurrency: number,
   data: WebhookJobData
@@ -130,7 +113,8 @@ async function processWebhookJob(
   await updateJobStatus(data.jobId, "started", null);
 
   try {
-    await unzipInUrlWorker(workerConcurrency, data.fileUrl, data.jobId);
+    const pool = getUnzipWorkerPool(workerConcurrency);
+    await pool.execute({ fileUrl: data.fileUrl, jobId: data.jobId });
     await updateJobStatus(data.jobId, "complete", null);
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : "Unknown worker error";

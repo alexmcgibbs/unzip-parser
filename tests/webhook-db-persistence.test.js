@@ -2,7 +2,6 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
-const { pathToFileURL } = require("node:url");
 const request = require("supertest");
 const { Pool } = require("pg");
 
@@ -16,18 +15,17 @@ process.env.WEBHOOK_QUEUE_NAME ||= `webhook-zip-process-dbtest-${process.pid}`;
 
 const { app, startWebhookQueueWorker, stopWebhookQueueWorker } = require("../dist/index.js");
 const WEBHOOK_QUEUE_NAME = process.env.WEBHOOK_QUEUE_NAME;
+let appServer;
+let appBaseUrl;
 
-function toRegularFileUrl(filePath) {
-  const normalizedPath = filePath.replace(/\\/g, "/");
-  const wslMountMatch = normalizedPath.match(/^\/mnt\/([a-z])\/(.+)$/i);
-
-  if (wslMountMatch) {
-    const drive = wslMountMatch[1].toUpperCase();
-    const rest = wslMountMatch[2];
-    return `file:///${drive}:/${rest}`;
+function getReachableBaseUrl(address) {
+  if (!address || typeof address === "string") {
+    throw new Error("Failed to resolve app test server address.");
   }
 
-  return pathToFileURL(filePath).href;
+  return address.family === "IPv6"
+    ? `http://[::1]:${address.port}`
+    : `http://127.0.0.1:${address.port}`;
 }
 
 const pool = new Pool({
@@ -72,6 +70,16 @@ async function clearPendingWebhookQueueJobs() {
     // Skip cleanup when pgboss schema is unavailable in the current environment.
   }
 }
+
+test.before(async () => {
+  appServer = await new Promise((resolve, reject) => {
+    const server = app.listen(0, () => resolve(server));
+    server.once("error", reject);
+  });
+
+  const address = appServer.address();
+  appBaseUrl = getReachableBaseUrl(address);
+});
 
 async function waitForCondition(check, timeoutMs = 45000, intervalMs = 500) {
   const start = Date.now();
@@ -119,21 +127,17 @@ test("persists files, accounts, and holdings rows after webhook upload", async (
 
   const projectRoot = path.resolve(__dirname, "..");
   const sampleJsonPath = path.join(projectRoot, "sample.json");
-  const sampleZipPath = path.join(projectRoot, "sample.zip");
   const expectedPayload = JSON.parse(fs.readFileSync(sampleJsonPath, "utf8"));
   const expectedHoldingsCount = expectedPayload.accounts.reduce(
     (sum, account) => sum + account.holdings.length,
     0
   );
 
-  if (!fs.existsSync(sampleZipPath)) {
-    t.skip(`sample.zip not found at ${sampleZipPath}; skipping DB persistence test.`);
-    return;
-  }
-
-  const sampleZipUrl = toRegularFileUrl(sampleZipPath);
+  const sampleZipUrl = `${appBaseUrl}/test?file=sample.zip`;
 
   await clearPendingWebhookQueueJobs();
+
+  await request(appServer).get("/test?file=sample.zip").expect(200);
 
   await startWebhookQueueWorker();
 
@@ -269,6 +273,12 @@ test("persists files, accounts, and holdings rows after webhook upload", async (
 });
 
 test.after(async () => {
+  if (appServer) {
+    await new Promise((resolve, reject) => {
+      appServer.close((err) => (err ? reject(err) : resolve()));
+    });
+  }
+
   await stopWebhookQueueWorker();
   await pool.end();
 });

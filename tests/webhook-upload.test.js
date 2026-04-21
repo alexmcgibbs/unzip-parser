@@ -9,6 +9,7 @@ process.env.DB_PORT ||= "5432";
 process.env.DB_NAME ||= "webhook_service";
 process.env.DB_USER ||= "webhook_user";
 process.env.DB_PASSWORD ||= "webhook_password";
+process.env.WEBHOOK_QUEUE_NAME ||= `webhook-zip-process-uploadtest-${process.pid}`;
 
 const { app, stopWebhookQueueWorker } = require("../dist/index.js");
 
